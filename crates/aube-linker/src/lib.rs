@@ -989,26 +989,21 @@ impl Linker {
                 .map(|dep| {
                     let target_dir = nm.join(&dep.name);
 
-                    // Already in place from a previous run — don't recount.
-                    // A *broken* symlink (target no longer exists) is left
-                    // over from a stale install and must be reclaimed so we
-                    // fall through and recreate it below.
-                    if keep_or_reclaim_broken_symlink(&target_dir)? {
-                        return Ok(false);
-                    }
-
                     // `link:` direct deps point at the on-disk target with
                     // a plain symlink, bypassing `.aube/` entirely.
                     if let Some(pkg) = graph.packages.get(&dep.dep_path)
                         && let Some(LocalSource::Link(rel)) = pkg.local_source.as_ref()
                     {
                         let abs_target = project_dir.join(rel);
-                        if let Some(parent) = target_dir.parent() {
-                            xx::file::mkdirp(parent).map_err(|e| Error::Xx(e.to_string()))?;
-                        }
                         let link_parent = target_dir.parent().unwrap_or(&nm);
                         let rel_target =
                             pathdiff::diff_paths(&abs_target, link_parent).unwrap_or(abs_target);
+                        if reconcile_top_level_link(&target_dir, &rel_target)? {
+                            return Ok(false);
+                        }
+                        if let Some(parent) = target_dir.parent() {
+                            xx::file::mkdirp(parent).map_err(|e| Error::Xx(e.to_string()))?;
+                        }
                         sys::create_dir_link(&rel_target, &target_dir)
                             .map_err(|e| Error::Io(target_dir.clone(), e))?;
                         return Ok(true);
@@ -1027,12 +1022,19 @@ impl Linker {
                     // For non-scoped packages the parent is node_modules/, but for
                     // scoped packages (e.g. @scope/name) it is node_modules/@scope/,
                     // so we must compute the relative path dynamically.
-                    if let Some(parent) = target_dir.parent() {
-                        xx::file::mkdirp(parent).map_err(|e| Error::Xx(e.to_string()))?;
-                    }
                     let link_parent = target_dir.parent().unwrap_or(&nm);
                     let rel_target = pathdiff::diff_paths(&source_dir, link_parent)
                         .unwrap_or_else(|| source_dir.clone());
+                    // Target-aware reconcile: a version upgrade keeps the
+                    // old `node_modules/<name>` symlink but it now points
+                    // at a stale `.aube/<old-dep-path>`; we need to
+                    // rewrite it to the new `.aube/<new-dep-path>`.
+                    if reconcile_top_level_link(&target_dir, &rel_target)? {
+                        return Ok(false);
+                    }
+                    if let Some(parent) = target_dir.parent() {
+                        xx::file::mkdirp(parent).map_err(|e| Error::Xx(e.to_string()))?;
+                    }
 
                     sys::create_dir_link(&rel_target, &target_dir)
                         .map_err(|e| Error::Io(target_dir.clone(), e))?;
@@ -1176,27 +1178,28 @@ impl Linker {
         let root_nm = root_dir.join(&self.modules_dir_name);
         let aube_dir = self.aube_dir_for(root_dir);
 
-        if root_nm.exists() {
-            debug!("removing existing root node_modules");
-            xx::file::remove_dir_all(&root_nm).map_err(|e| Error::Xx(e.to_string()))?;
-        }
-        // When `virtualStoreDir` points outside `root_nm` (custom
-        // override), wiping `root_nm` won't have cleared it, so
-        // workspace installs would otherwise carry stale entries
-        // across re-links. Removing before `mkdirp` gives the same
-        // clean-slate guarantee the default-path wipe provides.
-        if aube_dir.exists() && !aube_dir.starts_with(&root_nm) {
-            xx::file::remove_dir_all(&aube_dir).map_err(|e| Error::Xx(e.to_string()))?;
-        }
         xx::file::mkdirp(&aube_dir).map_err(|e| Error::Xx(e.to_string()))?;
-        // Recreate `root_nm` explicitly. With the default layout this is
-        // a no-op (`mkdirp(aube_dir)` created it as an ancestor); with a
-        // custom `virtualStoreDir` outside `node_modules/`, the later
-        // `create_dir_link` calls below need `root_nm` to exist up front
-        // — there's no other site that mkdirps it.
         xx::file::mkdirp(&root_nm).map_err(|e| Error::Xx(e.to_string()))?;
 
         let mut stats = LinkStats::default();
+
+        // Patch reconciliation. Mirrors `link_all`'s logic: wipe
+        // `.aube/<dep_path>` for any package whose patch fingerprint
+        // changed between the previous and current install. Only
+        // applies to per-project (non-gvs) mode because the gvs path
+        // already folds patches into the hashed `.aube/<dep_path>`
+        // name via `with_graph_hashes`.
+        let prev_applied = read_applied_patches(&root_nm);
+        let curr_applied = current_patch_hashes(&self.patches);
+        if !self.use_global_virtual_store {
+            wipe_changed_patched_entries(
+                &aube_dir,
+                graph,
+                &prev_applied,
+                &curr_applied,
+                self.virtual_store_dir_max_length,
+            );
+        }
 
         // Step 1a: Materialize local (`file:` dir/tarball) packages
         // straight into the shared per-project `.aube/`. They never
@@ -1213,44 +1216,126 @@ impl Linker {
             let Some(index) = package_indices.get(dep_path) else {
                 continue;
             };
+            let aube_entry = aube_dir.join(self.aube_dir_entry_name(dep_path));
+            if aube_entry.exists() {
+                stats.packages_cached += 1;
+                continue;
+            }
             self.materialize_into(&aube_dir, dep_path, pkg, index, &mut stats, false)?;
         }
 
         // Step 1b: Populate shared .aube virtual store at root for
-        // registry packages.
-        for (dep_path, pkg) in &graph.packages {
-            if pkg.local_source.is_some() {
-                continue;
+        // registry packages. Mirrors `link_all`'s parallel +
+        // Fresh/Missing/Stale state machine so warm re-runs are a
+        // `readlink` per package instead of a recreate per package.
+        if self.use_global_virtual_store {
+            use rayon::prelude::*;
+
+            let link_parallelism = self.link_parallelism();
+            let step1_timer = std::time::Instant::now();
+            let step1_results: Vec<Result<LinkStats, Error>> =
+                with_link_pool(link_parallelism, || {
+                    graph
+                        .packages
+                        .par_iter()
+                        .filter_map(|(dep_path, pkg)| {
+                            if pkg.local_source.is_some() {
+                                return None;
+                            }
+                            Some((dep_path, pkg))
+                        })
+                        .map(|(dep_path, pkg)| {
+                            let mut local_stats = LinkStats::default();
+                            let local_aube_entry =
+                                aube_dir.join(self.aube_dir_entry_name(dep_path));
+                            let global_entry =
+                                self.virtual_store.join(self.virtual_store_subdir(dep_path));
+
+                            enum EntryState {
+                                Fresh,
+                                Missing,
+                                Stale,
+                            }
+                            let state = match std::fs::read_link(&local_aube_entry) {
+                                Ok(existing) if existing == global_entry => {
+                                    if local_aube_entry.exists() {
+                                        EntryState::Fresh
+                                    } else {
+                                        EntryState::Stale
+                                    }
+                                }
+                                Ok(_) => EntryState::Stale,
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    EntryState::Missing
+                                }
+                                Err(_) => EntryState::Stale,
+                            };
+
+                            if matches!(state, EntryState::Fresh) {
+                                local_stats.packages_cached += 1;
+                                return Ok(local_stats);
+                            }
+
+                            let owned_index;
+                            let index = match package_indices.get(dep_path) {
+                                Some(idx) => idx,
+                                None => {
+                                    owned_index = self
+                                        .store
+                                        .load_index(pkg.registry_name(), &pkg.version)
+                                        .ok_or_else(|| {
+                                            Error::MissingPackageIndex(dep_path.to_string())
+                                        })?;
+                                    &owned_index
+                                }
+                            };
+                            self.ensure_in_virtual_store(dep_path, pkg, index, &mut local_stats)?;
+
+                            if matches!(state, EntryState::Stale) {
+                                let _ = std::fs::remove_dir(&local_aube_entry)
+                                    .or_else(|_| std::fs::remove_file(&local_aube_entry));
+                            }
+                            if let Some(parent) = local_aube_entry.parent() {
+                                xx::file::mkdirp(parent).map_err(|e| Error::Xx(e.to_string()))?;
+                            }
+                            sys::create_dir_link(&global_entry, &local_aube_entry)
+                                .map_err(|e| Error::Io(local_aube_entry.clone(), e))?;
+                            Ok(local_stats)
+                        })
+                        .collect()
+                });
+
+            for result in step1_results {
+                let local_stats = result?;
+                stats.packages_linked += local_stats.packages_linked;
+                stats.packages_cached += local_stats.packages_cached;
+                stats.files_linked += local_stats.files_linked;
             }
-            // Workspace installs always wipe `root_nm` above, so the
-            // fetch phase's "already linked" fast path is invalid
-            // here — `.aube/<dep_path>` was just deleted. Lazy-load
-            // the index from the store on demand when the sparse
-            // `package_indices` map doesn't cover this dep_path.
-            let owned_index;
-            let index = match package_indices.get(dep_path) {
-                Some(idx) => idx,
-                None => {
-                    let Some(idx) = self.store.load_index(pkg.registry_name(), &pkg.version) else {
-                        return Err(Error::MissingPackageIndex(dep_path.to_string()));
-                    };
-                    owned_index = idx;
-                    &owned_index
+            log::debug!(
+                "link_workspace:step1 (gvs populate) {:.1?}",
+                step1_timer.elapsed()
+            );
+        } else {
+            for (dep_path, pkg) in &graph.packages {
+                if pkg.local_source.is_some() {
+                    continue;
                 }
-            };
-
-            if self.use_global_virtual_store {
-                self.ensure_in_virtual_store(dep_path, pkg, index, &mut stats)?;
-
-                let local_aube_entry = aube_dir.join(self.aube_dir_entry_name(dep_path));
-                let global_entry = self.virtual_store.join(self.virtual_store_subdir(dep_path));
-
-                if let Some(parent) = local_aube_entry.parent() {
-                    xx::file::mkdirp(parent).map_err(|e| Error::Xx(e.to_string()))?;
+                let aube_entry = aube_dir.join(self.aube_dir_entry_name(dep_path));
+                if aube_entry.exists() {
+                    stats.packages_cached += 1;
+                    continue;
                 }
-                sys::create_dir_link(&global_entry, &local_aube_entry)
-                    .map_err(|e| Error::Io(local_aube_entry.clone(), e))?;
-            } else {
+                let owned_index;
+                let index = match package_indices.get(dep_path) {
+                    Some(idx) => idx,
+                    None => {
+                        owned_index = self
+                            .store
+                            .load_index(pkg.registry_name(), &pkg.version)
+                            .ok_or_else(|| Error::MissingPackageIndex(dep_path.to_string()))?;
+                        &owned_index
+                    }
+                };
                 self.materialize_into(&aube_dir, dep_path, pkg, index, &mut stats, false)?;
             }
         }
@@ -1263,7 +1348,34 @@ impl Linker {
         // are the install driver's responsibility to skip in this
         // mode.
         if self.virtual_store_only {
+            // Sweep root_nm of any user-visible entries a prior
+            // (non-virtualStoreOnly) install left behind. With the
+            // default `virtualStoreDir`, `.aube/` lives directly
+            // under `root_nm` and must be preserved. Custom
+            // `virtualStoreDir` overrides put `.aube/` outside the
+            // sweep zone already.
+            let aube_dir_leaf: Option<std::ffi::OsString> =
+                if aube_dir.parent() == Some(root_nm.as_path()) {
+                    aube_dir.file_name().map(|s| s.to_owned())
+                } else {
+                    None
+                };
+            if let Ok(entries) = std::fs::read_dir(&root_nm) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with('.') {
+                        continue;
+                    }
+                    if aube_dir_leaf.as_deref() == Some(name.as_os_str()) {
+                        continue;
+                    }
+                    let _ = std::fs::remove_dir_all(entry.path());
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
             self.link_hidden_hoist(&aube_dir, graph)?;
+            write_applied_patches(&root_nm, &curr_applied);
             return Ok(stats);
         }
 
@@ -1285,118 +1397,224 @@ impl Linker {
                 std::collections::HashMap::new()
             };
 
-        // Step 2: For each importer, create node_modules with its direct deps
-        for (importer_path, deps) in &graph.importers {
-            let pkg_dir = if importer_path == "." {
-                root_dir.to_path_buf()
+        // Step 2a: Per-importer setup — ensure each importer's
+        // `node_modules/` exists and sweep entries no longer in that
+        // importer's direct deps. Cheap serial work (workspace
+        // importers count is small; the expensive symlink syscalls
+        // run in parallel below). For the root importer we also
+        // expand the preserve set with `shamefullyHoist` /
+        // `publicHoistPattern` matches so the hoist passes that run
+        // after Step 2 don't redo work they'd have preserved.
+        let aube_dir_leaf_root: Option<std::ffi::OsString> =
+            if aube_dir.parent() == Some(root_nm.as_path()) {
+                aube_dir.file_name().map(|s| s.to_owned())
             } else {
-                root_dir.join(importer_path)
+                None
             };
 
-            let nm = pkg_dir.join(&self.modules_dir_name);
-            if importer_path != "." && nm.exists() {
-                xx::file::remove_dir_all(&nm).map_err(|e| Error::Xx(e.to_string()))?;
-            }
+        for (importer_path, deps) in &graph.importers {
+            let nm = if importer_path == "." {
+                root_nm.clone()
+            } else {
+                root_dir.join(importer_path).join(&self.modules_dir_name)
+            };
             if importer_path != "." {
                 xx::file::mkdirp(&nm).map_err(|e| Error::Xx(e.to_string()))?;
             }
 
-            for dep in deps {
-                // `dedupeDirectDeps`: when a non-root importer declares
-                // the same package the workspace root does and they
-                // resolve to the same `dep_path` (which captures both
-                // version and peer context), skip the per-importer
-                // symlink. Node's parent-directory walk from inside
-                // the workspace package will reach the root-level
-                // symlink and resolve the same copy. Only applies to
-                // non-root importers — the root is the source of truth.
-                if self.dedupe_direct_deps
-                    && importer_path != "."
-                    && let Some(root_dep) = root_deps_by_name.get(dep.name.as_str())
-                    && root_dep.dep_path == dep.dep_path
-                {
-                    continue;
+            let mut preserve: std::collections::HashSet<&str> =
+                deps.iter().map(|d| d.name.as_str()).collect();
+            if importer_path == "." {
+                if self.shamefully_hoist {
+                    for pkg in graph.packages.values() {
+                        preserve.insert(pkg.name.as_str());
+                    }
+                } else if !self.public_hoist_patterns.is_empty() {
+                    for pkg in graph.packages.values() {
+                        if pkg.local_source.is_none() && self.public_hoist_matches(&pkg.name) {
+                            preserve.insert(pkg.name.as_str());
+                        }
+                    }
                 }
-
-                // Check if this dep is a workspace package
-                if let Some(ws_dir) = workspace_dirs.get(&dep.name) {
-                    // `hoist-workspace-packages=false` suppresses
-                    // the `node_modules/<ws-pkg>` symlink. The
-                    // workspace graph still records the dep, so a
-                    // cross-importer `workspace:` resolution keeps
-                    // working — only a plain top-level import of
-                    // the workspace package stops resolving.
-                    if !self.hoist_workspace_packages {
+            }
+            let scope_prefixes: std::collections::HashSet<&str> = preserve
+                .iter()
+                .filter_map(|n| n.split_once('/').map(|(scope, _)| scope))
+                .collect();
+            let aube_leaf_here: Option<&std::ffi::OsString> = if importer_path == "." {
+                aube_dir_leaf_root.as_ref()
+            } else {
+                None
+            };
+            if let Ok(entries) = std::fs::read_dir(&nm) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with('.') {
                         continue;
                     }
-                    // Symlink to the workspace package directory
-                    let link_path = nm.join(&dep.name);
-                    // Compute relative path from the symlink's parent (handles scoped packages)
-                    let link_parent = link_path.parent().unwrap_or(&nm);
-                    let target =
-                        pathdiff::diff_paths(ws_dir, link_parent).unwrap_or(ws_dir.clone());
-
-                    if let Some(parent) = link_path.parent() {
-                        xx::file::mkdirp(parent).map_err(|e| Error::Xx(e.to_string()))?;
+                    if aube_leaf_here.map(|l| l.as_os_str()) == Some(name.as_os_str()) {
+                        continue;
                     }
-
-                    sys::create_dir_link(&target, &link_path)
-                        .map_err(|e| Error::Io(link_path.clone(), e))?;
-
-                    stats.top_level_linked += 1;
-                    continue;
+                    if preserve.contains(name_str.as_ref()) {
+                        continue;
+                    }
+                    if scope_prefixes.contains(name_str.as_ref()) {
+                        let scope_dir = entry.path();
+                        if let Ok(inner) = std::fs::read_dir(&scope_dir) {
+                            for inner_entry in inner.flatten() {
+                                let inner_name = inner_entry.file_name();
+                                let full = format!("{}/{}", name_str, inner_name.to_string_lossy());
+                                if !preserve.contains(full.as_str()) {
+                                    let _ = std::fs::remove_dir_all(inner_entry.path());
+                                    let _ = std::fs::remove_file(inner_entry.path());
+                                }
+                            }
+                        }
+                        // If the scope is now empty (no preserved members
+                        // left), drop the tombstone directory too.
+                        if std::fs::read_dir(&scope_dir)
+                            .map(|mut d| d.next().is_none())
+                            .unwrap_or(false)
+                        {
+                            let _ = std::fs::remove_dir(&scope_dir);
+                        }
+                        continue;
+                    }
+                    let _ = std::fs::remove_dir_all(entry.path());
+                    let _ = std::fs::remove_file(entry.path());
                 }
+            }
+        }
 
-                // `link:` direct deps point straight at the on-disk
-                // target. The resolver's `rebase_local` normalizes
-                // the path to be relative to the workspace root
-                // (`root_dir`), not the importer's directory, so the
-                // absolute target is always `root_dir.join(rel)`
-                // regardless of which importer declared the dep.
-                if let Some(locked) = graph.packages.get(&dep.dep_path)
-                    && let Some(LocalSource::Link(rel)) = locked.local_source.as_ref()
-                {
-                    let abs_target = root_dir.join(rel);
+        // Step 2b: Create top-level symlinks in parallel.
+        // Flatten (importer, dep) pairs so every symlink syscall
+        // runs through the rayon pool — 3k+ serial
+        // `create_dir_link` calls was the second-biggest slice of
+        // the workspace install phase before this change.
+        use rayon::prelude::*;
+
+        #[derive(Clone)]
+        struct Step2Task<'a> {
+            importer_path: &'a str,
+            nm: PathBuf,
+            dep: &'a aube_lockfile::DirectDep,
+        }
+        let tasks: Vec<Step2Task<'_>> = graph
+            .importers
+            .iter()
+            .flat_map(|(importer_path, deps)| {
+                let nm = if importer_path == "." {
+                    root_nm.clone()
+                } else {
+                    root_dir.join(importer_path).join(&self.modules_dir_name)
+                };
+                deps.iter().map(move |dep| Step2Task {
+                    importer_path: importer_path.as_str(),
+                    nm: nm.clone(),
+                    dep,
+                })
+            })
+            .collect();
+
+        let link_parallelism = self.link_parallelism();
+        let step2_timer = std::time::Instant::now();
+        let step2_results: Vec<Result<bool, Error>> = with_link_pool(link_parallelism, || {
+            tasks
+                .par_iter()
+                .map(|task| {
+                    let Step2Task {
+                        importer_path,
+                        nm,
+                        dep,
+                    } = task;
+
+                    // `dedupeDirectDeps`: non-root importer dep
+                    // already covered by the root symlink +
+                    // parent-directory walk.
+                    if self.dedupe_direct_deps
+                        && *importer_path != "."
+                        && let Some(root_dep) = root_deps_by_name.get(dep.name.as_str())
+                        && root_dep.dep_path == dep.dep_path
+                    {
+                        return Ok(false);
+                    }
+
                     let link_path = nm.join(&dep.name);
+
+                    // Workspace dep (`workspace:` protocol): link
+                    // straight into the sibling package dir.
+                    if let Some(ws_dir) = workspace_dirs.get(&dep.name) {
+                        if !self.hoist_workspace_packages {
+                            return Ok(false);
+                        }
+                        let link_parent = link_path.parent().unwrap_or(nm);
+                        let rel_target =
+                            pathdiff::diff_paths(ws_dir, link_parent).unwrap_or(ws_dir.clone());
+                        if reconcile_top_level_link(&link_path, &rel_target)? {
+                            return Ok(false);
+                        }
+                        if let Some(parent) = link_path.parent() {
+                            xx::file::mkdirp(parent).map_err(|e| Error::Xx(e.to_string()))?;
+                        }
+                        sys::create_dir_link(&rel_target, &link_path)
+                            .map_err(|e| Error::Io(link_path.clone(), e))?;
+                        return Ok(true);
+                    }
+
+                    // `link:` dep — absolute path relative to `root_dir`.
+                    if let Some(locked) = graph.packages.get(&dep.dep_path)
+                        && let Some(LocalSource::Link(rel)) = locked.local_source.as_ref()
+                    {
+                        let abs_target = root_dir.join(rel);
+                        let link_parent = link_path.parent().unwrap_or(nm);
+                        let rel_target =
+                            pathdiff::diff_paths(&abs_target, link_parent).unwrap_or(abs_target);
+                        if reconcile_top_level_link(&link_path, &rel_target)? {
+                            return Ok(false);
+                        }
+                        if let Some(parent) = link_path.parent() {
+                            xx::file::mkdirp(parent).map_err(|e| Error::Xx(e.to_string()))?;
+                        }
+                        sys::create_dir_link(&rel_target, &link_path)
+                            .map_err(|e| Error::Io(link_path.clone(), e))?;
+                        return Ok(true);
+                    }
+
+                    // Regular registry dep — symlink to the root
+                    // `.aube/<dep_path>/node_modules/<name>`.
+                    let source_dir = aube_dir
+                        .join(self.aube_dir_entry_name(&dep.dep_path))
+                        .join("node_modules")
+                        .join(&dep.name);
+                    if !source_dir.exists() {
+                        return Ok(false);
+                    }
+                    let link_parent = link_path.parent().unwrap_or(nm);
+                    let rel_target = pathdiff::diff_paths(&source_dir, link_parent)
+                        .unwrap_or_else(|| source_dir.clone());
+                    if reconcile_top_level_link(&link_path, &rel_target)? {
+                        return Ok(false);
+                    }
                     if let Some(parent) = link_path.parent() {
                         xx::file::mkdirp(parent).map_err(|e| Error::Xx(e.to_string()))?;
                     }
-                    let link_parent = link_path.parent().unwrap_or(&nm);
-                    let rel_target =
-                        pathdiff::diff_paths(&abs_target, link_parent).unwrap_or(abs_target);
                     sys::create_dir_link(&rel_target, &link_path)
                         .map_err(|e| Error::Io(link_path.clone(), e))?;
-                    stats.top_level_linked += 1;
-                    continue;
-                }
-
-                // Regular dep — symlink from importer's node_modules to root .aube.
-                // The .aube/<dep_path>/node_modules/ already contains sibling
-                // symlinks to transitive deps (set up by materialize_into).
-                let source_dir = aube_dir
-                    .join(self.aube_dir_entry_name(&dep.dep_path))
-                    .join("node_modules")
-                    .join(&dep.name);
-                if !source_dir.exists() {
-                    continue;
-                }
-
-                let target_dir = nm.join(&dep.name);
-                let link_parent = target_dir.parent().unwrap_or(&nm);
-                let rel_target =
-                    pathdiff::diff_paths(&source_dir, link_parent).unwrap_or(source_dir.clone());
-
-                if let Some(parent) = target_dir.parent() {
-                    xx::file::mkdirp(parent).map_err(|e| Error::Xx(e.to_string()))?;
-                }
-
-                sys::create_dir_link(&rel_target, &target_dir)
-                    .map_err(|e| Error::Io(target_dir.clone(), e))?;
-
-                trace!("workspace top-level: {} -> {}", dep.name, importer_path);
+                    trace!("workspace top-level: {} -> {}", dep.name, importer_path);
+                    Ok(true)
+                })
+                .collect()
+        });
+        for result in step2_results {
+            if result? {
                 stats.top_level_linked += 1;
             }
         }
+        log::debug!(
+            "link_workspace:step2 (top-level symlinks) {:.1?}",
+            step2_timer.elapsed()
+        );
 
         // Hoisting passes run against the *root* importer only —
         // pnpm never hoists into nested workspace packages. Run the
@@ -1429,6 +1647,7 @@ impl Linker {
         // sufficient for the whole workspace.
         self.link_hidden_hoist(&aube_dir, graph)?;
 
+        write_applied_patches(&root_nm, &curr_applied);
         Ok(stats)
     }
 
@@ -1503,11 +1722,33 @@ impl Linker {
     /// Shared `shamefully_hoist` implementation. For every non-local
     /// package in the graph, create a symlink at `nm/<pkg.name>`
     /// pointing at the matching `.aube/<dep_path>/node_modules/<pkg.name>`
-    /// entry. Names already claimed by a prior pass (direct deps,
-    /// workspace packages, link: deps) are preserved — first-write-wins.
-    /// Iteration order is BTreeMap-stable so the tiebreaker is
-    /// deterministic across runs. `trace_label` distinguishes the
-    /// `link_all` vs `link_workspace` callers in `-v` output.
+    /// entry.
+    ///
+    /// Two separate "first-write-wins" protections apply:
+    ///
+    /// - **Direct deps always win over hoisted transitives.** Names
+    ///   that appear in `graph.root_deps()` were placed (or
+    ///   deliberately skipped) by Step 2 and must never be overwritten
+    ///   by a hoist pass — that would silently swap `node_modules/foo`
+    ///   from the version the user pinned to whatever transitive
+    ///   happened to sort first.
+    /// - **Within the hoist pass, BTree iteration order is the
+    ///   tiebreaker across versions.** The `claimed` set records
+    ///   names we already hoisted this call so a later iteration with
+    ///   the same name (different `dep_path`) doesn't clobber the
+    ///   first winner.
+    ///
+    /// For everything else the caller gets a *target-aware* reconcile:
+    /// an existing symlink at `nm/<name>` that points at the version
+    /// this iteration wants is kept; one pointing at a stale
+    /// `.aube/<old-dep-path>/` (leftover from a prior install whose
+    /// hoisted version has since changed) is replaced. The old
+    /// plain-`exists?` check here kept stale entries because the
+    /// surrounding linker used to wipe `nm` unconditionally — now that
+    /// we sweep surgically, hoist has to cope with partial priors.
+    ///
+    /// `trace_label` distinguishes the `link_all` vs `link_workspace`
+    /// callers in `-v` output.
     fn hoist_remaining_into(
         &self,
         nm: &Path,
@@ -1517,6 +1758,17 @@ impl Linker {
         trace_label: &str,
         select: &dyn Fn(&str) -> bool,
     ) -> Result<(), Error> {
+        // Root direct-dep names. Populated from the importer map
+        // rather than an opaque "touched by Step 2" signal so a direct
+        // dep that *failed* to place (missing `source_dir.exists()`,
+        // workspace toggle, etc.) still reserves its slot — pnpm
+        // doesn't hoist over a direct dep even when the direct dep
+        // couldn't be installed.
+        let direct_dep_names: std::collections::HashSet<&str> =
+            graph.root_deps().iter().map(|d| d.name.as_str()).collect();
+
+        let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         for (dep_path, pkg) in &graph.packages {
             if pkg.local_source.is_some() {
                 continue;
@@ -1524,8 +1776,14 @@ impl Linker {
             if !select(&pkg.name) {
                 continue;
             }
-            let target_dir = nm.join(&pkg.name);
-            if keep_or_reclaim_broken_symlink(&target_dir)? {
+            // Direct deps always win over hoisting.
+            if direct_dep_names.contains(pkg.name.as_str()) {
+                continue;
+            }
+            // First-writer-wins within the hoist pass: if an earlier
+            // iteration already hoisted this name, later iterations
+            // with the same name don't overwrite it.
+            if !claimed.insert(pkg.name.clone()) {
                 continue;
             }
             let source_dir = aube_dir
@@ -1533,14 +1791,25 @@ impl Linker {
                 .join("node_modules")
                 .join(&pkg.name);
             if !source_dir.exists() {
+                // Don't remove `name` from `claimed` — another
+                // iteration for the same name would also find its
+                // `source_dir` missing (the `.aube` populate phase
+                // runs before hoist for every package), and leaving
+                // the name claimed preserves the existing symlink
+                // (whatever it points at) instead of repeatedly
+                // probing for a materialization that isn't coming.
+                continue;
+            }
+            let target_dir = nm.join(&pkg.name);
+            let link_parent = target_dir.parent().unwrap_or(nm);
+            let rel_target = pathdiff::diff_paths(&source_dir, link_parent)
+                .unwrap_or_else(|| source_dir.clone());
+            if reconcile_top_level_link(&target_dir, &rel_target)? {
                 continue;
             }
             if let Some(parent) = target_dir.parent() {
                 xx::file::mkdirp(parent).map_err(|e| Error::Xx(e.to_string()))?;
             }
-            let link_parent = target_dir.parent().unwrap_or(nm);
-            let rel_target = pathdiff::diff_paths(&source_dir, link_parent)
-                .unwrap_or_else(|| source_dir.clone());
             sys::create_dir_link(&rel_target, &target_dir)
                 .map_err(|e| Error::Io(target_dir.clone(), e))?;
             trace!("{trace_label}: {}", pkg.name);
@@ -1933,19 +2202,78 @@ fn validate_index_key(key: &str) -> Result<(), Error> {
 /// pair to identify "something is at `path` but its target is gone",
 /// and use the same `remove_dir().or_else(remove_file())` fallback
 /// used elsewhere in this file to unlink both shapes.
-fn keep_or_reclaim_broken_symlink(path: &Path) -> Result<bool, Error> {
-    if path.symlink_metadata().is_err() {
-        return Ok(false);
+/// Reconcile a top-level `node_modules/<name>` entry against the
+/// expected symlink target. Compares the link's *target* — a version
+/// upgrade that leaves `.aube/<old-dep-path>/` resolvable on disk is
+/// correctly classified as stale instead of silently keeping the old
+/// symlink.
+///
+/// - `Ok(true)`  – existing entry is a symlink pointing at
+///   `expected_target`; caller skips creation.
+/// - `Ok(false)` – no entry exists, or a stale entry (wrong target,
+///   dangling symlink, regular directory) has been best-effort
+///   removed; caller should proceed to create the symlink.
+///
+/// Unix and Windows use different comparison strategies because
+/// `create_dir_link` writes the target differently on each platform:
+/// Unix preserves the relative target bytes-for-bytes as a POSIX
+/// symlink, Windows normalizes to an absolute path before calling
+/// `junction::create`. A plain `read_link == expected` check that
+/// works on Unix would miss every warm run on Windows.
+fn reconcile_top_level_link(link_path: &Path, expected_target: &Path) -> Result<bool, Error> {
+    #[cfg(windows)]
+    {
+        // NTFS junctions store normalized absolute targets
+        // (sometimes `\\?\`-prefixed), so comparing against the
+        // relative `pathdiff::diff_paths` output the callers compute
+        // would never match. Compare the canonical forms instead: if
+        // the junction resolves to the same directory
+        // `expected_target` points at, the link is fresh. Anything
+        // else (dangling, wrong target, not a reparse point) falls
+        // through to a best-effort reclaim.
+        let expected_abs = if expected_target.is_absolute() {
+            expected_target.to_path_buf()
+        } else {
+            let parent = link_path.parent().unwrap_or_else(|| Path::new(""));
+            parent.join(expected_target)
+        };
+        if let Ok(link_canon) = link_path.canonicalize()
+            && let Ok(exp_canon) = expected_abs.canonicalize()
+            && link_canon == exp_canon
+        {
+            return Ok(true);
+        }
+        if link_path.symlink_metadata().is_err() {
+            return Ok(false);
+        }
+        match std::fs::remove_dir(link_path).or_else(|_| std::fs::remove_file(link_path)) {
+            Ok(()) => Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(Error::Io(link_path.to_path_buf(), e)),
+        }
     }
-    // `Path::exists` follows symlinks/junctions, so a dangling link
-    // returns false here even though `symlink_metadata` succeeded.
-    if path.exists() {
-        return Ok(true);
-    }
-    match std::fs::remove_dir(path).or_else(|_| std::fs::remove_file(path)) {
-        Ok(()) => Ok(false),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(Error::Io(path.to_path_buf(), e)),
+    #[cfg(not(windows))]
+    {
+        match std::fs::read_link(link_path) {
+            Ok(existing) if existing == expected_target => Ok(true),
+            Ok(_) => {
+                // Wrong target — remove the stale symlink so the
+                // caller's `create_dir_link` below doesn't EEXIST.
+                let _ = std::fs::remove_dir(link_path).or_else(|_| std::fs::remove_file(link_path));
+                Ok(false)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => {
+                // `read_link` failed with EINVAL (entry exists but
+                // isn't a symlink — e.g. a regular directory left by
+                // a prior hoisted install) or another error.
+                // Best-effort reclaim so the create call lands on a
+                // clean slot.
+                let _ =
+                    std::fs::remove_dir_all(link_path).or_else(|_| std::fs::remove_file(link_path));
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -2555,6 +2883,240 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&foo1).unwrap(),
             std::fs::read_to_string(&foo2).unwrap()
+        );
+    }
+
+    /// Regression: a version bump keeps the same top-level name
+    /// (`foo`) but must repoint `node_modules/foo` at the new
+    /// `.aube/foo@<new>` entry. The old `.aube/foo@<old>/` is left
+    /// on disk (no one sweeps the virtual store by name), so a
+    /// plain `path.exists()` check would see a still-resolving
+    /// stale symlink and keep it. The target-aware
+    /// `reconcile_top_level_link` compares the expected target
+    /// string and rewrites the link.
+    #[test]
+    fn test_link_all_repoints_symlink_after_version_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let store = Store::at(dir.path().join("store/files"));
+
+        // Install 1: foo@1.0.0 as the root's direct dep.
+        let mut indices_v1 = BTreeMap::new();
+        let foo_v1 = store
+            .import_bytes(b"module.exports = 'foo@1';", false)
+            .unwrap();
+        let mut foo_v1_index = BTreeMap::new();
+        foo_v1_index.insert("index.js".to_string(), foo_v1);
+        indices_v1.insert("foo@1.0.0".to_string(), foo_v1_index);
+
+        let mut graph_v1 = LockfileGraph::default();
+        graph_v1.packages.insert(
+            "foo@1.0.0".to_string(),
+            LockedPackage {
+                name: "foo".to_string(),
+                version: "1.0.0".to_string(),
+                dep_path: "foo@1.0.0".to_string(),
+                ..Default::default()
+            },
+        );
+        graph_v1.importers.insert(
+            ".".to_string(),
+            vec![DirectDep {
+                name: "foo".to_string(),
+                dep_path: "foo@1.0.0".to_string(),
+                dep_type: DepType::Production,
+                specifier: None,
+            }],
+        );
+
+        let linker = Linker::new(&store, LinkStrategy::Copy);
+        linker
+            .link_all(&project_dir, &graph_v1, &indices_v1)
+            .unwrap();
+        let foo_link = project_dir.join("node_modules/foo");
+        assert!(foo_link.symlink_metadata().unwrap().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(foo_link.join("index.js")).unwrap(),
+            "module.exports = 'foo@1';"
+        );
+
+        // Install 2: foo upgraded to 2.0.0. The `.aube/foo@1.0.0/`
+        // tree stays on disk (nothing prunes the virtual store by
+        // name), so the old `node_modules/foo` symlink still
+        // resolves — a naive "does the target exist?" check would
+        // keep it.
+        let mut indices_v2 = BTreeMap::new();
+        let foo_v2 = store
+            .import_bytes(b"module.exports = 'foo@2';", false)
+            .unwrap();
+        let mut foo_v2_index = BTreeMap::new();
+        foo_v2_index.insert("index.js".to_string(), foo_v2);
+        indices_v2.insert("foo@2.0.0".to_string(), foo_v2_index);
+
+        let mut graph_v2 = LockfileGraph::default();
+        graph_v2.packages.insert(
+            "foo@2.0.0".to_string(),
+            LockedPackage {
+                name: "foo".to_string(),
+                version: "2.0.0".to_string(),
+                dep_path: "foo@2.0.0".to_string(),
+                ..Default::default()
+            },
+        );
+        graph_v2.importers.insert(
+            ".".to_string(),
+            vec![DirectDep {
+                name: "foo".to_string(),
+                dep_path: "foo@2.0.0".to_string(),
+                dep_type: DepType::Production,
+                specifier: None,
+            }],
+        );
+        linker
+            .link_all(&project_dir, &graph_v2, &indices_v2)
+            .unwrap();
+
+        // The top-level symlink must now resolve to foo@2.0.0's
+        // bytes, not foo@1.0.0's.
+        assert_eq!(
+            std::fs::read_to_string(project_dir.join("node_modules/foo/index.js")).unwrap(),
+            "module.exports = 'foo@2';"
+        );
+    }
+
+    /// Regression: `shamefully_hoist` hoists transitive deps to the
+    /// top-level `node_modules/<name>`. When the hoisted version
+    /// changes between installs (transitive bump), the previous
+    /// implementation kept the stale symlink because
+    /// `keep_or_reclaim_broken_symlink` only checked "does target
+    /// resolve?" and the old `.aube/<old-dep-path>/` was still on
+    /// disk. `reconcile_top_level_link` + the explicit
+    /// direct-dep/claimed tracking in `hoist_remaining_into` together
+    /// fix this.
+    #[test]
+    fn test_shamefully_hoist_repoints_after_transitive_version_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let store = Store::at(dir.path().join("store/files"));
+
+        // Install 1: root → bar@1.0.0 → foo@1.0.0 (transitive).
+        let foo_v1 = store
+            .import_bytes(b"module.exports = 'foo@1';", false)
+            .unwrap();
+        let mut foo_v1_idx = BTreeMap::new();
+        foo_v1_idx.insert("index.js".to_string(), foo_v1);
+        let bar_v1 = store
+            .import_bytes(b"module.exports = 'bar@1';", false)
+            .unwrap();
+        let mut bar_v1_idx = BTreeMap::new();
+        bar_v1_idx.insert("index.js".to_string(), bar_v1);
+        let mut indices_v1 = BTreeMap::new();
+        indices_v1.insert("foo@1.0.0".to_string(), foo_v1_idx);
+        indices_v1.insert("bar@1.0.0".to_string(), bar_v1_idx);
+
+        let mut graph_v1 = LockfileGraph::default();
+        let mut bar_deps_v1 = BTreeMap::new();
+        bar_deps_v1.insert("foo".to_string(), "1.0.0".to_string());
+        graph_v1.packages.insert(
+            "bar@1.0.0".to_string(),
+            LockedPackage {
+                name: "bar".to_string(),
+                version: "1.0.0".to_string(),
+                dep_path: "bar@1.0.0".to_string(),
+                dependencies: bar_deps_v1,
+                ..Default::default()
+            },
+        );
+        graph_v1.packages.insert(
+            "foo@1.0.0".to_string(),
+            LockedPackage {
+                name: "foo".to_string(),
+                version: "1.0.0".to_string(),
+                dep_path: "foo@1.0.0".to_string(),
+                ..Default::default()
+            },
+        );
+        graph_v1.importers.insert(
+            ".".to_string(),
+            vec![DirectDep {
+                name: "bar".to_string(),
+                dep_path: "bar@1.0.0".to_string(),
+                dep_type: DepType::Production,
+                specifier: None,
+            }],
+        );
+
+        let linker = Linker::new(&store, LinkStrategy::Copy).with_shamefully_hoist(true);
+        linker
+            .link_all(&project_dir, &graph_v1, &indices_v1)
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(project_dir.join("node_modules/foo/index.js")).unwrap(),
+            "module.exports = 'foo@1';",
+            "install 1 should hoist foo@1.0.0"
+        );
+
+        // Install 2: bar@1.0.0 → foo@2.0.0 (transitive bump). The
+        // stale `.aube/foo@1.0.0/` tree is still on disk (nothing
+        // sweeps the virtual store by name), so the old hoisted
+        // symlink would still resolve — the old `exists?` check
+        // would silently keep it.
+        let foo_v2 = store
+            .import_bytes(b"module.exports = 'foo@2';", false)
+            .unwrap();
+        let mut foo_v2_idx = BTreeMap::new();
+        foo_v2_idx.insert("index.js".to_string(), foo_v2);
+        let mut indices_v2 = BTreeMap::new();
+        // Reuse bar's materialized index from v1.
+        let bar_v1_for_v2 = store
+            .import_bytes(b"module.exports = 'bar@1';", false)
+            .unwrap();
+        let mut bar_v1_idx_v2 = BTreeMap::new();
+        bar_v1_idx_v2.insert("index.js".to_string(), bar_v1_for_v2);
+        indices_v2.insert("bar@1.0.0".to_string(), bar_v1_idx_v2);
+        indices_v2.insert("foo@2.0.0".to_string(), foo_v2_idx);
+
+        let mut graph_v2 = LockfileGraph::default();
+        let mut bar_deps_v2 = BTreeMap::new();
+        bar_deps_v2.insert("foo".to_string(), "2.0.0".to_string());
+        graph_v2.packages.insert(
+            "bar@1.0.0".to_string(),
+            LockedPackage {
+                name: "bar".to_string(),
+                version: "1.0.0".to_string(),
+                dep_path: "bar@1.0.0".to_string(),
+                dependencies: bar_deps_v2,
+                ..Default::default()
+            },
+        );
+        graph_v2.packages.insert(
+            "foo@2.0.0".to_string(),
+            LockedPackage {
+                name: "foo".to_string(),
+                version: "2.0.0".to_string(),
+                dep_path: "foo@2.0.0".to_string(),
+                ..Default::default()
+            },
+        );
+        graph_v2.importers.insert(
+            ".".to_string(),
+            vec![DirectDep {
+                name: "bar".to_string(),
+                dep_path: "bar@1.0.0".to_string(),
+                dep_type: DepType::Production,
+                specifier: None,
+            }],
+        );
+
+        linker
+            .link_all(&project_dir, &graph_v2, &indices_v2)
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(project_dir.join("node_modules/foo/index.js")).unwrap(),
+            "module.exports = 'foo@2';",
+            "install 2 should repoint the hoisted symlink to foo@2.0.0"
         );
     }
 
