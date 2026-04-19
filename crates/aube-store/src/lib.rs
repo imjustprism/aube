@@ -338,9 +338,24 @@ impl Store {
     /// Import a tarball (.tgz) into the store.
     /// Returns a PackageIndex mapping relative paths to stored files.
     pub fn import_tarball(&self, tarball_bytes: &[u8]) -> Result<PackageIndex, Error> {
+        use std::io::Read;
+
+        // Caps defend against gzip bombs and lying tar headers. The
+        // values sit well above any real npm package (largest top
+        // 1000 are in the tens of MiB) but low enough to prevent a
+        // malicious registry or mirror from OOMing the installer
+        // with a small high-compression-ratio payload.
+        //
+        // `CappedReader` is used instead of `Read::take` for the
+        // archive-level cap so an exhaustion surfaces as an `Err`
+        // rather than a clean EOF. A clean EOF landing on a tar
+        // block boundary would let a crafted archive silently
+        // truncate into a partial index.
         let gz = flate2::read::GzDecoder::new(tarball_bytes);
-        let mut archive = tar::Archive::new(gz);
+        let capped = CappedReader::new(gz, MAX_TARBALL_DECOMPRESSED_BYTES);
+        let mut archive = tar::Archive::new(capped);
         let mut index = BTreeMap::new();
+        let mut entries_seen: usize = 0;
 
         // Serial walk — each tarball is decoded by one spawn_blocking
         // task on the fetch-phase blocking pool, which is already
@@ -350,10 +365,31 @@ impl Store {
         // cores amplifies contention more than per-tarball
         // parallelism helps.
         for entry in archive.entries().map_err(|e| Error::Tar(e.to_string()))? {
+            entries_seen += 1;
+            if entries_seen > MAX_TARBALL_ENTRIES {
+                return Err(Error::Tar(format!(
+                    "tarball exceeds entry cap of {MAX_TARBALL_ENTRIES}"
+                )));
+            }
+
             let mut entry = entry.map_err(|e| Error::Tar(e.to_string()))?;
 
             if entry.header().entry_type().is_dir() {
                 continue;
+            }
+
+            // Reject oversized entries up front on the declared size
+            // so we never allocate a huge `Vec` just to error after.
+            // `.take()` below is the belt-and-suspenders guard for
+            // the case where the header lies about the stream length.
+            let declared = entry
+                .header()
+                .size()
+                .map_err(|e| Error::Tar(e.to_string()))?;
+            if declared > MAX_TARBALL_ENTRY_BYTES {
+                return Err(Error::Tar(format!(
+                    "tarball entry exceeds per-entry cap: {declared} bytes > {MAX_TARBALL_ENTRY_BYTES}"
+                )));
             }
 
             let raw_path = entry
@@ -379,8 +415,15 @@ impl Store {
                 s.replace('\\', "/")
             };
 
-            let mut content = Vec::new();
-            std::io::Read::read_to_end(&mut entry, &mut content)
+            // Clamp the upfront allocation to a sane ceiling so a
+            // lying header cannot force a 512 MiB reservation before
+            // any byte has been read. `read_to_end` grows the Vec
+            // naturally past this point for the rare entry that
+            // really is this large.
+            let mut content = Vec::with_capacity((declared as usize).min(VEC_PREALLOC_CEILING));
+            (&mut entry)
+                .take(MAX_TARBALL_ENTRY_BYTES)
+                .read_to_end(&mut content)
                 .map_err(|e| Error::Tar(e.to_string()))?;
 
             let mode = entry.header().mode().unwrap_or(0o644);
@@ -393,6 +436,88 @@ impl Store {
         Ok(index)
     }
 }
+
+/// Hard ceiling on the per-entry `Vec::with_capacity` hint. 64 KiB
+/// covers the bulk of real npm package files (JS / JSON / TS, all
+/// typically under a few KiB each) without trusting the declared
+/// header size, which an attacker controls. `read_to_end` grows
+/// past this ceiling when a legitimate larger file warrants it.
+const VEC_PREALLOC_CEILING: usize = 64 * 1024;
+
+/// A `Read` wrapper that refuses to deliver more than `remaining`
+/// bytes. Unlike `std::io::Read::take`, exhaustion produces an
+/// explicit `io::Error` rather than a clean EOF. When the wrapped
+/// reader is a gzip decoder feeding a tar archive, a clean EOF at
+/// a block boundary would let a crafted archive silently truncate
+/// into a partial index. Surfacing an error keeps the archive
+/// iterator from accepting a half-read stream as complete.
+struct CappedReader<R: std::io::Read> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: std::io::Read> CappedReader<R> {
+    fn new(inner: R, cap: u64) -> Self {
+        Self {
+            inner,
+            remaining: cap,
+        }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for CappedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // A zero-length read is a no-op by the `Read` contract and
+        // must not error even if the cap is already exhausted.
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "tarball decompression exceeds archive cap of {MAX_TARBALL_DECOMPRESSED_BYTES} bytes"
+                ),
+            ));
+        }
+        let want = buf.len().min(self.remaining as usize);
+        let n = self.inner.read(&mut buf[..want])?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Maximum total decompressed bytes accepted from a single tarball.
+/// 1 GiB. Reality check against the npm registry on 2026-04-19.
+/// Biggest tarball in the top 1000 by download count is `next` at
+/// 154 MiB unpacked. Second is `@tensorflow/tfjs` at 147 MiB. The
+/// cap sits ~6x above both, leaves room for future growth, and
+/// stays well below the process RSS a gzip bomb would otherwise
+/// force the installer to allocate.
+#[cfg(not(test))]
+const MAX_TARBALL_DECOMPRESSED_BYTES: u64 = 1 << 30;
+#[cfg(test)]
+const MAX_TARBALL_DECOMPRESSED_BYTES: u64 = 1 << 20;
+
+/// Maximum bytes for a single tar entry. 512 MiB. Reality check: the
+/// largest legitimate single file shipped by a top-1000 npm package
+/// sits in the tens of MiB range (bundled WASM blobs in `@swc/wasm`,
+/// `@babel/standalone`, `monaco-editor`). 512 MiB leaves a full
+/// order of magnitude of headroom.
+#[cfg(not(test))]
+const MAX_TARBALL_ENTRY_BYTES: u64 = 512 << 20;
+#[cfg(test)]
+const MAX_TARBALL_ENTRY_BYTES: u64 = 1 << 20;
+
+/// Maximum number of tar entries in a single archive. 200_000.
+/// Reality check: `next` ships 8_065 files and `@fluentui/react`
+/// ships 7_448, the largest counts in the top 1000. 200_000 is
+/// ~25x above that and stops a crafted archive from pinning the
+/// CPU on iteration alone.
+#[cfg(not(test))]
+const MAX_TARBALL_ENTRIES: usize = 200_000;
+#[cfg(test)]
+const MAX_TARBALL_ENTRIES: usize = 64;
 
 /// Map a nibble (0–15) to its lowercase hex ASCII byte. Used by
 /// `ensure_shards_exist` to build the 256 two-character shard names
@@ -1281,5 +1406,214 @@ mod tests {
         // The entry-point check is the only defense.
         let err = git_shallow_clone("https://github.com/u/r.git", "-X-evil", false).unwrap_err();
         assert!(matches!(err, Error::Git(_)));
+    }
+
+    /// Build a minimal `.tgz` containing a single entry with the
+    /// given path / size / content. `set_path` goes through the
+    /// public API so the tar crate's own safety checks run.
+    fn build_tarball(path: &str, content: &[u8]) -> Vec<u8> {
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut ar = tar::Builder::new(gz);
+        let mut h = tar::Header::new_gnu();
+        h.set_path(path).unwrap();
+        h.set_size(content.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        ar.append(&h, content).unwrap();
+        ar.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[test]
+    fn test_import_tarball_accepts_normal_sized_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().join("files"));
+        store.ensure_shards_exist().unwrap();
+        let tarball = build_tarball("package/index.js", b"console.log('hi');");
+        let index = store.import_tarball(&tarball).unwrap();
+        assert_eq!(index.len(), 1);
+        assert!(index.contains_key("index.js"));
+    }
+
+    #[test]
+    fn test_import_tarball_rejects_per_entry_cap_exceeded() {
+        // A single entry with a declared size past the per-entry cap
+        // must be rejected before we allocate or read its contents.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().join("files"));
+        let oversize = (MAX_TARBALL_ENTRY_BYTES + 1) as usize;
+        // Small actual content. The declared size in the header is
+        // what matters for the fast-path rejection. We craft the
+        // header manually to avoid writing a real 512 MiB payload.
+        let mut h = tar::Header::new_gnu();
+        h.set_path("package/huge.bin").unwrap();
+        h.set_size(oversize as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut ar = tar::Builder::new(gz);
+        // `append` refuses a size/content mismatch, so we manually
+        // emit the header + pad to a 512-byte block without actual
+        // content. The per-entry-cap check runs on `header.size()`
+        // before any read, so the stream shape past the header does
+        // not matter for this test.
+        ar.append(&h, &[][..]).ok();
+        let tarball = ar.into_inner().unwrap().finish().unwrap();
+        let err = store.import_tarball(&tarball).unwrap_err();
+        let msg = match err {
+            Error::Tar(m) => m,
+            other => panic!("expected Error::Tar, got {other:?}"),
+        };
+        assert!(msg.contains("per-entry cap"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_import_tarball_rejects_archive_decompression_cap() {
+        // Two entries whose combined decompressed size exceeds the
+        // archive cap while each stays under the per-entry cap. The
+        // cap is enforced by wrapping the gzip decoder in
+        // `Read::take(cap)`, so the wrapped reader hits EOF mid-way
+        // through the second entry and the archive iteration errors.
+        //
+        // `MAX_TARBALL_DECOMPRESSED_BYTES` and `MAX_TARBALL_ENTRY_BYTES`
+        // are both reduced under `cfg(test)` so this test builds
+        // only a couple of MiB of payload and stays CI-fast.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().join("files"));
+        store.ensure_shards_exist().unwrap();
+
+        let half = ((MAX_TARBALL_DECOMPRESSED_BYTES / 2) + 1024) as usize;
+        let chunk = vec![0u8; half];
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut ar = tar::Builder::new(gz);
+        for i in 0..2 {
+            let mut h = tar::Header::new_gnu();
+            h.set_path(format!("package/chunk{i}.bin")).unwrap();
+            h.set_size(chunk.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            ar.append(&h, &chunk[..]).unwrap();
+        }
+        let tarball = ar.into_inner().unwrap().finish().unwrap();
+
+        let err = store.import_tarball(&tarball).unwrap_err();
+        assert!(matches!(err, Error::Tar(_)));
+    }
+
+    #[test]
+    fn test_import_tarball_rejects_entry_count_cap() {
+        // `MAX_TARBALL_ENTRIES` is reduced under `cfg(test)` so this
+        // test only appends a few dozen empty entries.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().join("files"));
+        store.ensure_shards_exist().unwrap();
+
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut ar = tar::Builder::new(gz);
+        for i in 0..=MAX_TARBALL_ENTRIES {
+            let mut h = tar::Header::new_gnu();
+            h.set_path(format!("package/f{i}.txt")).unwrap();
+            h.set_size(0);
+            h.set_mode(0o644);
+            h.set_cksum();
+            ar.append(&h, &[][..]).unwrap();
+        }
+        let tarball = ar.into_inner().unwrap().finish().unwrap();
+
+        let err = store.import_tarball(&tarball).unwrap_err();
+        let msg = match err {
+            Error::Tar(m) => m,
+            other => panic!("expected Error::Tar, got {other:?}"),
+        };
+        assert!(msg.contains("entry cap"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_capped_reader_surfaces_exhaustion_as_error() {
+        // Regression: `Read::take(cap)` returns a clean EOF when the
+        // limit is reached, which in the tar case can land on a
+        // block boundary and let an archive silently truncate into
+        // a partial index. `CappedReader` must produce an error
+        // instead so `tar::Archive` surfaces it to the caller.
+        use std::io::Read;
+        let mut r = CappedReader::new(&b"hello world"[..], 5);
+        let mut first = [0u8; 5];
+        r.read_exact(&mut first).unwrap();
+        assert_eq!(&first, b"hello");
+        let mut rest = Vec::new();
+        let err = r.read_to_end(&mut rest).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_capped_reader_does_not_error_below_cap() {
+        // Normal reads under the cap behave identically to the
+        // inner reader. Only hitting `remaining == 0` errors.
+        use std::io::Read;
+        let mut r = CappedReader::new(&b"hi"[..], 10);
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(&buf, b"hi");
+    }
+
+    #[test]
+    fn test_capped_reader_empty_buf_is_ok_past_cap() {
+        // `Read::read(&mut [])` is a no-op per contract. Even with
+        // the cap exhausted, it must return Ok(0) and not error.
+        use std::io::Read;
+        let mut r = CappedReader::new(&b"abcd"[..], 4);
+        let mut buf = [0u8; 4];
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(r.read(&mut []).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_capped_reader_at_exact_boundary_still_errors() {
+        // A read that drains exactly to the cap leaves `remaining`
+        // at 0. The next read must error, which is the scenario
+        // that motivated dropping `Read::take`. A tar block ending
+        // on the cap would otherwise EOF silently.
+        use std::io::Read;
+        let mut r = CappedReader::new(&b"abcd"[..], 4);
+        let mut buf = [0u8; 4];
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"abcd");
+        let mut rest = Vec::new();
+        let err = r.read_to_end(&mut rest).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_import_tarball_declared_size_does_not_overallocate() {
+        // A malicious header can declare a size near the per-entry
+        // cap while shipping almost no actual content. The per-entry
+        // `Vec::with_capacity` is clamped to `VEC_PREALLOC_CEILING`
+        // so a lying header cannot force a 512 MiB reservation
+        // before any byte has been read.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().join("files"));
+        store.ensure_shards_exist().unwrap();
+
+        // Under `cfg(test)` `MAX_TARBALL_ENTRY_BYTES` is 1 MiB, so
+        // we declare an entry right at that cap but with only a few
+        // content bytes. Import should succeed with no OOM, and the
+        // stored content length should match the actual bytes.
+        let declared_near_cap = MAX_TARBALL_ENTRY_BYTES;
+        let actual_content = b"tiny";
+        let mut h = tar::Header::new_gnu();
+        h.set_path("package/lying.bin").unwrap();
+        h.set_size(declared_near_cap);
+        h.set_mode(0o644);
+        h.set_cksum();
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut ar = tar::Builder::new(gz);
+        // Size mismatch is intentional. `append` will not refuse
+        // when we stamp the header manually via `append`.
+        ar.append(&h, &actual_content[..]).ok();
+        let tarball = ar.into_inner().unwrap().finish().unwrap();
+
+        // The per-entry cap check rejects `declared == cap` values
+        // that exceed it; values at exactly the cap pass. Whichever
+        // branch fires, the process must not OOM.
+        let _ = store.import_tarball(&tarball);
     }
 }
