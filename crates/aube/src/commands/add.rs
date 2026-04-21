@@ -49,17 +49,19 @@ pub struct AddArgs {
     /// Add the dependency to the workspace root's `package.json`,
     /// regardless of the current working directory.
     ///
-    /// Walks up from cwd looking for `aube-workspace.yaml` /
-    /// `pnpm-workspace.yaml` and runs the add against that directory.
+    /// Walks up from cwd looking for `aube-workspace.yaml`,
+    /// `pnpm-workspace.yaml`, or a `package.json` with a `workspaces`
+    /// field and runs the add against that directory.
     #[arg(short = 'w', long, conflicts_with = "global")]
     pub workspace: bool,
     /// Allow `add` to run in a workspace root.
     ///
     /// By default aube refuses to add dependencies to the root
     /// `package.json` of a workspace (a directory containing
-    /// `aube-workspace.yaml` or `pnpm-workspace.yaml`) because deps
-    /// added there end up shared by every package and usually reflect
-    /// a mistake. Pass this flag to opt in. Mirrors `pnpm add -W`.
+    /// `aube-workspace.yaml`, `pnpm-workspace.yaml`, or a `package.json`
+    /// with a `workspaces` field) because deps added there end up
+    /// shared by every package and usually reflect a mistake. Pass
+    /// this flag to opt in. Mirrors `pnpm add -W`.
     #[arg(short = 'W', long)]
     pub ignore_workspace_root_check: bool,
 }
@@ -266,14 +268,31 @@ pub async fn run(
     // package and usually reflect a mistake. `-W` /
     // `--ignore-workspace-root-check` bypasses the check, and `-w` /
     // `--workspace` implies the bypass since the user explicitly
-    // targeted the root. We only trip on a workspace file that
-    // actually declares `packages:` — a bare catalog-only file is
-    // not a workspace root.
+    // targeted the root. We trip on a *declared* package-pattern list,
+    // not on the materialized glob — an empty `packages/*` directory
+    // is still a workspace root the user should opt into. Bare
+    // catalog-only yaml is not a workspace root, and a `package.json`
+    // without a `workspaces` field isn't either.
     if !ignore_workspace_root_check && !workspace {
+        // `WorkspaceConfig::load` already returns an empty `packages`
+        // list when no yaml exists, so propagating errors here only
+        // surfaces genuine yaml problems (permission denied, malformed
+        // YAML) instead of silently letting `add` proceed against what
+        // might actually be a workspace root.
         let ws = aube_manifest::WorkspaceConfig::load(&cwd)
             .into_diagnostic()
             .wrap_err("failed to read workspace config")?;
-        if !ws.packages.is_empty() {
+        let yaml_has_packages = !ws.packages.is_empty();
+        // `package.json` read errors fall through intentionally: the
+        // install pipeline below re-reads and parses the same file and
+        // surfaces a richer miette diagnostic pointing at the offending
+        // byte. Duplicating that error here would double-report.
+        let pkg_json_has_workspaces =
+            aube_manifest::PackageJson::from_path(&cwd.join("package.json"))
+                .ok()
+                .and_then(|m| m.workspaces)
+                .is_some_and(|w| !w.patterns().is_empty());
+        if yaml_has_packages || pkg_json_has_workspaces {
             return Err(miette!(
                 "refusing to add dependencies to the workspace root. \
                  If this is intentional, pass --ignore-workspace-root-check (-W)."
@@ -761,11 +780,17 @@ async fn run_filtered(
         return Err(miette!("no packages specified"));
     }
     let cwd = crate::dirs::cwd()?;
-    let matched = super::select_workspace_packages(&cwd, filter, "add")?;
-    let _lock = super::take_project_lock(&cwd)?;
+    // The workspace root — not the child `cwd` — is what owns the
+    // lockfile and the project lock in yarn / npm / bun monorepos.
+    // Taking the lock or snapshotting the lockfile against `cwd` would
+    // target a stale subpackage path, letting `install::run` (which
+    // walks up) mutate the real root lockfile and then silently skip
+    // the restore under `--no-save`.
+    let (root, matched) = super::select_workspace_packages(&cwd, filter, "add")?;
+    let _lock = super::take_project_lock(&root)?;
 
     let mut snapshots = Vec::new();
-    let lockfile_path = lockfile_path_for_project(&cwd);
+    let lockfile_path = lockfile_path_for_project(&root);
     let root_lockfile_snapshot = if args.no_save {
         match std::fs::read(&lockfile_path) {
             Ok(bytes) => Some(bytes),

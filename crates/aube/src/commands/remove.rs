@@ -18,10 +18,11 @@ pub struct RemoveArgs {
     /// Remove the dependency from the workspace root's `package.json`,
     /// regardless of the current working directory.
     ///
-    /// Walks up from cwd looking for `aube-workspace.yaml` /
-    /// `pnpm-workspace.yaml` and runs the remove against that
-    /// directory. Takes precedence over `--filter` when both are
-    /// supplied (same as `add --workspace`).
+    /// Walks up from cwd looking for `aube-workspace.yaml`,
+    /// `pnpm-workspace.yaml`, or a `package.json` with a `workspaces`
+    /// field and runs the remove against that directory. Takes
+    /// precedence over `--filter` when both are supplied (same as
+    /// `add --workspace`).
     #[arg(short = 'w', long, conflicts_with = "global")]
     pub workspace: bool,
 }
@@ -141,7 +142,7 @@ async fn run_filtered(
     filter: &aube_workspace::selector::EffectiveFilter,
 ) -> miette::Result<()> {
     let cwd = crate::dirs::cwd()?;
-    let matched = super::select_workspace_packages(&cwd, filter, "remove")?;
+    let (_root, matched) = super::select_workspace_packages(&cwd, filter, "remove")?;
     let result = async {
         for pkg in matched {
             super::retarget_cwd(&pkg.dir)?;
