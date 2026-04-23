@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -215,38 +216,52 @@ pub struct WriteStateLayout<'a> {
     pub placements: Option<&'a aube_linker::HoistedPlacements>,
 }
 
-pub fn write_state(
-    project_dir: &Path,
-    section_filtered: bool,
-    cli_flags: &[(String, String)],
-    package_content_hashes: BTreeMap<String, String>,
-    graph_lthash: String,
-    package_subtree_hashes: BTreeMap<String, String>,
-    layout: WriteStateLayout<'_>,
-) -> Result<(), std::io::Error> {
+pub struct WriteStateInput<'a> {
+    pub section_filtered: bool,
+    pub package_json_hashes: BTreeMap<String, String>,
+    pub cli_flags: &'a [(String, String)],
+    pub package_content_hashes: BTreeMap<String, String>,
+    pub graph_lthash: String,
+    pub package_subtree_hashes: BTreeMap<String, String>,
+    pub layout: WriteStateLayout<'a>,
+}
+
+pub fn write_state(project_dir: &Path, input: WriteStateInput<'_>) -> Result<(), std::io::Error> {
+    let WriteStateInput {
+        section_filtered,
+        package_json_hashes,
+        cli_flags,
+        package_content_hashes,
+        graph_lthash,
+        package_subtree_hashes,
+        layout,
+    } = input;
+
     let lockfile_hash = match active_lockfile(project_dir).1 {
         Some(path) => hash_file(&path),
         None => String::new(),
     };
+    let settings_hash = hash_settings(project_dir, cli_flags);
+    let install_layout = InstallLayoutState::from_graph(
+        project_dir,
+        layout.graph,
+        layout.node_linker,
+        layout.modules_dir_name,
+        layout.aube_dir,
+        layout.virtual_store_dir_max_length,
+        layout.placements,
+    );
 
     let state = InstallState {
         lockfile_hash,
-        package_json_hashes: collect_package_json_hashes(project_dir),
+        package_json_hashes,
         aube_version: env!("CARGO_PKG_VERSION").to_string(),
         section_filtered,
-        settings_hash: hash_settings(project_dir, cli_flags),
+        settings_hash,
         package_content_hashes,
         graph_lthash,
         package_subtree_hashes,
-        layout: Some(InstallLayoutState::from_graph(
-            project_dir,
-            layout.graph,
-            layout.node_linker,
-            layout.modules_dir_name,
-            layout.aube_dir,
-            layout.virtual_store_dir_max_length,
-            layout.placements,
-        )),
+        layout: Some(install_layout),
     };
 
     let state_path = state_file(project_dir);
@@ -531,25 +546,29 @@ fn read_installed_package_manifest(
     Ok(Some(parsed))
 }
 
-fn collect_package_json_hashes(project_dir: &Path) -> BTreeMap<String, String> {
-    let mut hashes = BTreeMap::new();
-    let pkg_path = project_dir.join("package.json");
-    if pkg_path.exists() {
-        hashes.insert(".".to_string(), hash_file(&pkg_path));
-    }
-    if let Ok(workspaces) = aube_workspace::find_workspace_packages(project_dir) {
-        for pkg_dir in workspaces {
-            let pkg_json = pkg_dir.join("package.json");
+pub fn collect_package_json_hashes_from_manifests(
+    project_dir: &Path,
+    manifests: &[(String, aube_manifest::PackageJson)],
+) -> BTreeMap<String, String> {
+    manifests
+        .par_iter()
+        .filter_map(|(rel, _)| {
+            let pkg_json = if rel == "." {
+                project_dir.join("package.json")
+            } else {
+                project_dir.join(rel).join("package.json")
+            };
             if !pkg_json.is_file() {
-                continue;
+                return None;
             }
-            hashes.insert(
-                relative_path_or_original(&pkg_json, project_dir),
-                hash_file(&pkg_json),
-            );
-        }
-    }
-    hashes
+            let key = if rel == "." {
+                ".".to_string()
+            } else {
+                relative_path_or_original(&pkg_json, project_dir)
+            };
+            Some((key, hash_file(&pkg_json)))
+        })
+        .collect()
 }
 
 fn hash_settings(project_dir: &Path, cli_flags: &[(String, String)]) -> String {
@@ -735,7 +754,8 @@ fn empty_blake3_hash() -> &'static str {
 mod tests {
     use super::{
         InstallLayoutMode, InstallLayoutState, InstallState, InstalledPackageState,
-        empty_blake3_hash, relative_path_or_original, verify_install_layout,
+        collect_package_json_hashes_from_manifests, empty_blake3_hash, hash_file,
+        relative_path_or_original, verify_install_layout,
     };
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
@@ -786,6 +806,33 @@ mod tests {
                 "installed package metadata missing: node_modules/.aube/missing/node_modules/is-odd/package.json"
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn collect_package_json_hashes_from_manifests_uses_file_paths_for_workspaces() {
+        let project_dir = temp_project_dir("manifest-hash-keys");
+        let root_pkg = project_dir.join("package.json");
+        let ws_pkg = project_dir.join("packages/foo/package.json");
+        std::fs::create_dir_all(ws_pkg.parent().expect("workspace dir"))
+            .expect("workspace dir should be creatable");
+        std::fs::write(&root_pkg, "{\"name\":\"root\"}").expect("root package.json should write");
+        std::fs::write(&ws_pkg, "{\"name\":\"foo\"}").expect("workspace package.json should write");
+
+        let manifests = vec![
+            (".".to_string(), aube_manifest::PackageJson::default()),
+            (
+                "packages/foo".to_string(),
+                aube_manifest::PackageJson::default(),
+            ),
+        ];
+
+        let hashes = collect_package_json_hashes_from_manifests(&project_dir, &manifests);
+
+        assert_eq!(hashes.get("."), Some(&hash_file(&root_pkg)));
+        assert_eq!(
+            hashes.get("packages/foo/package.json"),
+            Some(&hash_file(&ws_pkg))
         );
     }
 
