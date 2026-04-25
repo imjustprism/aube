@@ -399,6 +399,9 @@ impl LocalSource {
 /// - `git+ssh://git@host/user/repo.git[#ref]`
 /// - `git://host/user/repo.git[#ref]`
 /// - `https://host/user/repo.git[#ref]` (only when ending in `.git`)
+/// - `user@host:path[.git][#ref]` (scp-form, only for github.com / gitlab.com /
+///   bitbucket.org — matches pnpm 11 behavior, where unknown SCP hosts are
+///   treated as local paths) → `ssh://user@host/path[.git]`
 /// - `github:user/repo[#ref]` → `https://github.com/user/repo.git`
 /// - `gitlab:user/repo[#ref]` → `https://gitlab.com/user/repo.git`
 /// - `bitbucket:user/repo[#ref]` → `https://bitbucket.org/user/repo.git`
@@ -423,6 +426,8 @@ pub fn parse_git_spec(spec: &str) -> Option<(String, Option<String>, Option<Stri
         rest.to_string()
     } else if body.starts_with("git://") {
         body.to_string()
+    } else if let Some(scp) = parse_scp_url(body) {
+        scp
     } else if let Some(path) = body.strip_prefix("github:") {
         format!("https://github.com/{path}.git")
     } else if let Some(path) = body.strip_prefix("gitlab:") {
@@ -445,6 +450,34 @@ pub fn parse_git_spec(spec: &str) -> Option<(String, Option<String>, Option<Stri
         return None;
     };
     Some((url, committish, subpath))
+}
+
+fn parse_scp_url(body: &str) -> Option<String> {
+    if body.contains("://") {
+        return None;
+    }
+    let colon = body.find(':')?;
+    let before = &body[..colon];
+    let path = &body[colon + 1..];
+    if before.is_empty() || path.is_empty() {
+        return None;
+    }
+    if path.starts_with('/') {
+        return None;
+    }
+    let at = before.find('@')?;
+    let user = &before[..at];
+    let host = &before[at + 1..];
+    if user.is_empty() || host.is_empty() || host.contains('/') || host.contains('@') {
+        return None;
+    }
+    // pnpm 11 only resolves SCP-form as hosted Git for the three known
+    // providers; other hosts (e.g. `git@example.com:foo/bar.git`) are
+    // treated as local paths, and `host:path` without a user errors.
+    if !matches!(host, "github.com" | "gitlab.com" | "bitbucket.org") {
+        return None;
+    }
+    Some(format!("ssh://{user}@{host}/{path}"))
 }
 
 /// Normalize git URL fragments used by npm-compatible lockfiles.
@@ -2052,6 +2085,41 @@ mod git_spec_tests {
     fn github_shorthand_expands_and_roundtrips() {
         let (url, _, _) = parse_git_spec("github:user/repo").unwrap();
         assert_eq!(url, "https://github.com/user/repo.git");
+    }
+
+    #[test]
+    fn scp_form_recognized() {
+        let (url, committish, _) =
+            parse_git_spec("git@github.com:EthanHenrickson/math-mcp.git").unwrap();
+        assert_eq!(url, "ssh://git@github.com/EthanHenrickson/math-mcp.git");
+        assert!(committish.is_none());
+    }
+
+    #[test]
+    fn scp_form_with_ref_recognized() {
+        let (url, committish, _) =
+            parse_git_spec("git@github.com:EthanHenrickson/math-mcp.git#0.1.5").unwrap();
+        assert_eq!(url, "ssh://git@github.com/EthanHenrickson/math-mcp.git");
+        assert_eq!(committish.as_deref(), Some("0.1.5"));
+    }
+
+    #[test]
+    fn scp_form_bitbucket_recognized() {
+        let (url, _, _) = parse_git_spec("git@bitbucket.org:pnpmjs/git-resolver.git").unwrap();
+        assert_eq!(url, "ssh://git@bitbucket.org/pnpmjs/git-resolver.git");
+    }
+
+    #[test]
+    fn scp_form_unknown_host_rejected() {
+        // pnpm 11 treats `user@unknown-host:path` as a local path, not Git.
+        assert!(parse_git_spec("git@example.com:org/repo.git").is_none());
+        assert!(parse_git_spec("alice@host.example.com:org/repo.git").is_none());
+    }
+
+    #[test]
+    fn scp_form_without_user_rejected() {
+        // pnpm 11 errors on bare `host:path` as unsupported.
+        assert!(parse_git_spec("github.com:user/repo.git").is_none());
     }
 
     #[test]

@@ -121,16 +121,18 @@ pub async fn run(args: DlxArgs) -> miette::Result<()> {
 
     // Minimal package.json. Version specs and dist-tags pass through as-is
     // — the resolver handles them exactly as it would from a real manifest.
-    let deps: serde_json::Map<String, serde_json::Value> = install_specs
-        .iter()
-        .map(|spec| {
-            let (name, version) = split_spec(spec);
-            (
-                name.to_string(),
-                serde_json::Value::String(version.to_string()),
-            )
-        })
-        .collect();
+    let mut deps: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for spec in &install_specs {
+        let (mut name, value) = synthesize_dlx_dep(spec);
+        if deps.contains_key(&name) {
+            let mut suffix = 2usize;
+            while deps.contains_key(&format!("{name}-{suffix}")) {
+                suffix += 1;
+            }
+            name = format!("{name}-{suffix}");
+        }
+        deps.insert(name, serde_json::Value::String(value));
+    }
     let manifest = serde_json::json!({
         "name": "aube-dlx",
         "version": "0.0.0",
@@ -203,8 +205,8 @@ pub async fn run(args: DlxArgs) -> miette::Result<()> {
         // installed package's `bin` field and prefer the actual bin name
         // it ships — e.g. `@tanstack/cli` ships `tanstack`, not `cli`.
         let resolved_bin_name = if !explicit_package && !bin_dir.join(&bin_name).exists() {
-            resolve_bin_from_package(&modules_dir, &install_specs[0])
-                .unwrap_or_else(|| bin_name.clone())
+            let (pkg_name, _) = synthesize_dlx_dep(&install_specs[0]);
+            resolve_bin_from_package(&modules_dir, &pkg_name).unwrap_or_else(|| bin_name.clone())
         } else {
             bin_name.clone()
         };
@@ -293,10 +295,98 @@ fn split_spec(spec: &str) -> (&str, &str) {
     (name, version.unwrap_or("latest"))
 }
 
+fn is_non_registry_spec(s: &str) -> bool {
+    if s.starts_with("github:")
+        || s.starts_with("gitlab:")
+        || s.starts_with("bitbucket:")
+        || s.starts_with("gist:")
+        || s.starts_with("git+")
+        || s.starts_with("git://")
+        || s.starts_with("https://")
+        || s.starts_with("http://")
+        || s.starts_with("ssh://")
+        || s.starts_with("file:")
+        || s.starts_with("link:")
+    {
+        return true;
+    }
+    is_scp_form(s) || is_owner_repo_shorthand(s)
+}
+
+/// SCP-form `user@host:path` is only treated as Git for the three known
+/// providers, matching pnpm 11. Unknown hosts fall through (pnpm treats
+/// them as local paths).
+fn is_scp_form(s: &str) -> bool {
+    if s.contains("://") {
+        return false;
+    }
+    let Some(colon) = s.find(':') else {
+        return false;
+    };
+    let before = &s[..colon];
+    let Some(at) = before.find('@') else {
+        return false;
+    };
+    let user = &before[..at];
+    let host = &before[at + 1..];
+    if user.is_empty() || host.is_empty() {
+        return false;
+    }
+    matches!(host, "github.com" | "gitlab.com" | "bitbucket.org")
+}
+
+/// Pnpm 11: a bare `owner/repo[#ref]` with no provider prefix defaults
+/// to GitHub. Distinguished from registry specs (`name`, `@scope/name`,
+/// `name@version`) by: no leading `@`, no `@` anywhere (registry version
+/// separator), no `:` (URL/SCP), exactly one `/`, both halves non-empty.
+fn is_owner_repo_shorthand(s: &str) -> bool {
+    let body = s.split('#').next().unwrap_or(s);
+    if body.starts_with('@') || body.contains('@') || body.contains(':') {
+        return false;
+    }
+    let mut parts = body.splitn(2, '/');
+    let Some(owner) = parts.next() else {
+        return false;
+    };
+    let Some(repo) = parts.next() else {
+        return false;
+    };
+    !owner.is_empty() && !repo.is_empty() && !repo.contains('/')
+}
+
+fn derive_dlx_pkg_name(spec: &str) -> Option<String> {
+    let body = spec.split('#').next().unwrap_or(spec);
+    let after_colon = body.rsplit(':').next().unwrap_or(body);
+    let last = after_colon.rsplit('/').next().unwrap_or(after_colon);
+    let trimmed = last.strip_suffix(".git").unwrap_or(last);
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn synthesize_dlx_dep(spec: &str) -> (String, String) {
+    if is_owner_repo_shorthand(spec) {
+        // Rewrite to the explicit `github:` form so the resolver picks
+        // it up via the same code path as `aube dlx github:owner/repo`.
+        let name = derive_dlx_pkg_name(spec).unwrap_or_else(|| "aube-dlx-pkg".to_string());
+        return (name, format!("github:{spec}"));
+    }
+    if is_non_registry_spec(spec) {
+        let name = derive_dlx_pkg_name(spec).unwrap_or_else(|| "aube-dlx-pkg".to_string());
+        return (name, spec.to_string());
+    }
+    let (name, version) = split_spec(spec);
+    (name.to_string(), version.to_string())
+}
+
 /// The binary name `aube dlx <cmd>` should resolve to — strip any version
 /// suffix and any `@scope/` prefix, since `node_modules/.bin/` is flat and
 /// scoped packages still land under their unscoped bin name.
 fn bin_name_for(command: &str) -> String {
+    if is_non_registry_spec(command) {
+        return derive_dlx_pkg_name(command).unwrap_or_else(|| "aube-dlx-pkg".to_string());
+    }
     let (name, _) = split_spec(command);
     name.rsplit('/').next().unwrap_or(name).to_string()
 }
@@ -312,8 +402,7 @@ fn bin_name_for(command: &str) -> String {
 /// `modulesDir` still sees the fallback work. Returns `None` when we can't
 /// make a confident pick; caller keeps the original inference and lets the
 /// bin-missing error fire.
-fn resolve_bin_from_package(modules_dir: &std::path::Path, install_spec: &str) -> Option<String> {
-    let (pkg_name, _) = split_spec(install_spec);
+fn resolve_bin_from_package(modules_dir: &std::path::Path, pkg_name: &str) -> Option<String> {
     let pkg_json_path = modules_dir.join(pkg_name).join("package.json");
     let content = std::fs::read_to_string(&pkg_json_path).ok()?;
     let pkg_json: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -411,7 +500,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            resolve_bin_from_package(tmp.path(), "@tanstack/cli@latest"),
+            resolve_bin_from_package(tmp.path(), "@tanstack/cli"),
             Some("tanstack".to_string())
         );
     }
@@ -469,5 +558,83 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_pkg_json(tmp.path(), "foo", serde_json::json!({"name": "foo"}));
         assert_eq!(resolve_bin_from_package(tmp.path(), "foo"), None);
+    }
+
+    #[test]
+    fn synthesize_dlx_dep_handles_github_shorthand() {
+        let (name, value) = synthesize_dlx_dep("github:user/repo");
+        assert_eq!(name, "repo");
+        assert_eq!(value, "github:user/repo");
+    }
+
+    #[test]
+    fn synthesize_dlx_dep_handles_github_shorthand_with_ref() {
+        let (name, value) = synthesize_dlx_dep("github:user/repo#v1.2.3");
+        assert_eq!(name, "repo");
+        assert_eq!(value, "github:user/repo#v1.2.3");
+    }
+
+    #[test]
+    fn synthesize_dlx_dep_handles_scp_url() {
+        let (name, value) = synthesize_dlx_dep("git@github.com:user/repo.git");
+        assert_eq!(name, "repo");
+        assert_eq!(value, "git@github.com:user/repo.git");
+    }
+
+    #[test]
+    fn synthesize_dlx_dep_handles_scp_url_bitbucket() {
+        let (name, value) = synthesize_dlx_dep("git@bitbucket.org:pnpmjs/git-resolver.git");
+        assert_eq!(name, "git-resolver");
+        assert_eq!(value, "git@bitbucket.org:pnpmjs/git-resolver.git");
+    }
+
+    #[test]
+    fn synthesize_dlx_dep_rejects_unknown_host_scp() {
+        // pnpm 11 treats `user@unknown-host:path` as a local path, not Git.
+        // Aube falls through to registry handling — the install will fail
+        // later with a clearer error than silently cloning an arbitrary host.
+        let (name, _) = synthesize_dlx_dep("alice@host.example.com:org/repo.git");
+        assert_ne!(name, "repo");
+    }
+
+    #[test]
+    fn synthesize_dlx_dep_handles_owner_repo_shorthand() {
+        let (name, value) = synthesize_dlx_dep("zkochan/is-negative");
+        assert_eq!(name, "is-negative");
+        assert_eq!(value, "github:zkochan/is-negative");
+    }
+
+    #[test]
+    fn synthesize_dlx_dep_handles_owner_repo_shorthand_with_ref() {
+        let (name, value) = synthesize_dlx_dep("zkochan/is-negative#2.0.1");
+        assert_eq!(name, "is-negative");
+        assert_eq!(value, "github:zkochan/is-negative#2.0.1");
+    }
+
+    #[test]
+    fn synthesize_dlx_dep_handles_git_plus_url() {
+        let (name, value) = synthesize_dlx_dep("git+https://host/u/r.git#v1");
+        assert_eq!(name, "r");
+        assert_eq!(value, "git+https://host/u/r.git#v1");
+    }
+
+    #[test]
+    fn synthesize_dlx_dep_registry_spec_unchanged() {
+        let (name, value) = synthesize_dlx_dep("lodash@4.17.0");
+        assert_eq!(name, "lodash");
+        assert_eq!(value, "4.17.0");
+    }
+
+    #[test]
+    fn synthesize_dlx_dep_scoped_registry_spec_unchanged() {
+        let (name, value) = synthesize_dlx_dep("@babel/core@7.0.0");
+        assert_eq!(name, "@babel/core");
+        assert_eq!(value, "7.0.0");
+    }
+
+    #[test]
+    fn bin_name_for_non_registry_spec_uses_repo_name() {
+        assert_eq!(bin_name_for("github:user/repo"), "repo");
+        assert_eq!(bin_name_for("git@github.com:user/repo.git"), "repo");
     }
 }
