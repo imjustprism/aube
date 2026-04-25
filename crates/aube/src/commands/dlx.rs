@@ -205,8 +205,8 @@ pub async fn run(args: DlxArgs) -> miette::Result<()> {
         // installed package's `bin` field and prefer the actual bin name
         // it ships — e.g. `@tanstack/cli` ships `tanstack`, not `cli`.
         let resolved_bin_name = if !explicit_package && !bin_dir.join(&bin_name).exists() {
-            resolve_bin_from_package(&modules_dir, &install_specs[0])
-                .unwrap_or_else(|| bin_name.clone())
+            let (pkg_name, _) = synthesize_dlx_dep(&install_specs[0]);
+            resolve_bin_from_package(&modules_dir, &pkg_name).unwrap_or_else(|| bin_name.clone())
         } else {
             bin_name.clone()
         };
@@ -402,8 +402,7 @@ fn bin_name_for(command: &str) -> String {
 /// `modulesDir` still sees the fallback work. Returns `None` when we can't
 /// make a confident pick; caller keeps the original inference and lets the
 /// bin-missing error fire.
-fn resolve_bin_from_package(modules_dir: &std::path::Path, install_spec: &str) -> Option<String> {
-    let (pkg_name, _) = split_spec(install_spec);
+fn resolve_bin_from_package(modules_dir: &std::path::Path, pkg_name: &str) -> Option<String> {
     let pkg_json_path = modules_dir.join(pkg_name).join("package.json");
     let content = std::fs::read_to_string(&pkg_json_path).ok()?;
     let pkg_json: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -501,7 +500,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            resolve_bin_from_package(tmp.path(), "@tanstack/cli@latest"),
+            resolve_bin_from_package(tmp.path(), "@tanstack/cli"),
             Some("tanstack".to_string())
         );
     }
