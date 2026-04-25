@@ -121,13 +121,18 @@ pub async fn run(args: DlxArgs) -> miette::Result<()> {
 
     // Minimal package.json. Version specs and dist-tags pass through as-is
     // — the resolver handles them exactly as it would from a real manifest.
-    let deps: serde_json::Map<String, serde_json::Value> = install_specs
-        .iter()
-        .map(|spec| {
-            let (name, value) = synthesize_dlx_dep(spec);
-            (name, serde_json::Value::String(value))
-        })
-        .collect();
+    let mut deps: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for spec in &install_specs {
+        let (mut name, value) = synthesize_dlx_dep(spec);
+        if deps.contains_key(&name) {
+            let mut suffix = 2usize;
+            while deps.contains_key(&format!("{name}-{suffix}")) {
+                suffix += 1;
+            }
+            name = format!("{name}-{suffix}");
+        }
+        deps.insert(name, serde_json::Value::String(value));
+    }
     let manifest = serde_json::json!({
         "name": "aube-dlx",
         "version": "0.0.0",
@@ -291,18 +296,35 @@ fn split_spec(spec: &str) -> (&str, &str) {
 }
 
 fn is_non_registry_spec(s: &str) -> bool {
-    s.starts_with("github:")
+    if s.starts_with("github:")
         || s.starts_with("gitlab:")
         || s.starts_with("bitbucket:")
         || s.starts_with("gist:")
         || s.starts_with("git+")
         || s.starts_with("git://")
-        || s.starts_with("git@")
         || s.starts_with("https://")
         || s.starts_with("http://")
         || s.starts_with("ssh://")
         || s.starts_with("file:")
         || s.starts_with("link:")
+    {
+        return true;
+    }
+    is_scp_form(s)
+}
+
+fn is_scp_form(s: &str) -> bool {
+    if s.contains("://") {
+        return false;
+    }
+    let Some(colon) = s.find(':') else {
+        return false;
+    };
+    let before = &s[..colon];
+    let Some(at) = before.find('@') else {
+        return false;
+    };
+    !before[..at].is_empty() && !before[at + 1..].is_empty()
 }
 
 fn derive_dlx_pkg_name(spec: &str) -> Option<String> {
@@ -525,6 +547,13 @@ mod tests {
         let (name, value) = synthesize_dlx_dep("git@github.com:user/repo.git");
         assert_eq!(name, "repo");
         assert_eq!(value, "git@github.com:user/repo.git");
+    }
+
+    #[test]
+    fn synthesize_dlx_dep_handles_scp_url_with_non_git_user() {
+        let (name, value) = synthesize_dlx_dep("alice@host.example.com:org/repo.git");
+        assert_eq!(name, "repo");
+        assert_eq!(value, "alice@host.example.com:org/repo.git");
     }
 
     #[test]

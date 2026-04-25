@@ -399,7 +399,7 @@ impl LocalSource {
 /// - `git+ssh://git@host/user/repo.git[#ref]`
 /// - `git://host/user/repo.git[#ref]`
 /// - `https://host/user/repo.git[#ref]` (only when ending in `.git`)
-/// - `[user@]host:path[.git][#ref]` (scp-form) → `ssh://[user@]host/path[.git]`
+/// - `user@host:path[.git][#ref]` (scp-form) → `ssh://user@host/path[.git]`
 /// - `github:user/repo[#ref]` → `https://github.com/user/repo.git`
 /// - `gitlab:user/repo[#ref]` → `https://gitlab.com/user/repo.git`
 /// - `bitbucket:user/repo[#ref]` → `https://bitbucket.org/user/repo.git`
