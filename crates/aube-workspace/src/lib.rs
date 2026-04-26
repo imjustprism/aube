@@ -36,6 +36,19 @@ pub fn find_workspace_packages(project_dir: &Path) -> Result<Vec<PathBuf>, Error
         return Ok(vec![]);
     }
 
+    let mut neg_matchers = Vec::new();
+    let mut positives = Vec::new();
+    for raw in &patterns {
+        if let Some(rest) = raw.strip_prefix('!') {
+            let matcher = glob::Pattern::new(rest).map_err(|e| {
+                Error::Parse(project_dir.join("pnpm-workspace.yaml"), e.to_string())
+            })?;
+            neg_matchers.push(matcher);
+        } else {
+            positives.push(raw.as_str());
+        }
+    }
+
     // Overlapping patterns are valid and common — a project may list
     // both `packages/*` and a specific `packages/slack` entry, or mix
     // a glob with an explicit nested path (`packages/sdk/js`). Dedupe
@@ -45,8 +58,12 @@ pub fn find_workspace_packages(project_dir: &Path) -> Result<Vec<PathBuf>, Error
     // dep twice and blows up with EEXIST.
     let mut seen = std::collections::HashSet::new();
     let mut packages = Vec::new();
-    for pattern in &patterns {
+    for pattern in &positives {
         for pkg_dir in expand_workspace_pattern(project_dir, pattern)? {
+            let rel = pkg_dir.strip_prefix(project_dir).unwrap_or(&pkg_dir);
+            if is_negated(&neg_matchers, rel) {
+                continue;
+            }
             if seen.insert(pkg_dir.clone()) {
                 packages.push(pkg_dir);
             }
@@ -55,6 +72,13 @@ pub fn find_workspace_packages(project_dir: &Path) -> Result<Vec<PathBuf>, Error
 
     packages.sort_unstable();
     Ok(packages)
+}
+
+fn is_negated(matchers: &[glob::Pattern], rel: &Path) -> bool {
+    let padded = rel.join("_");
+    matchers
+        .iter()
+        .any(|m| m.matches_path(rel) || m.matches_path(&padded))
 }
 
 fn expand_workspace_pattern(project_dir: &Path, pattern: &str) -> Result<Vec<PathBuf>, Error> {
@@ -244,6 +268,103 @@ mod tests {
 
         let found = find_workspace_packages(dir.path()).unwrap();
         assert_eq!(names(found), ["y"].iter().map(|s| s.to_string()).collect());
+    }
+
+    #[test]
+    fn negation_patterns_exclude_matched_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n  - '!**/example/**'\n  - '!**/test/**'\n",
+        );
+        write(&dir.path().join("packages/keep/package.json"), "{}");
+        write(&dir.path().join("packages/example/package.json"), "{}");
+        write(&dir.path().join("packages/test/package.json"), "{}");
+
+        let found = find_workspace_packages(dir.path()).unwrap();
+        assert_eq!(
+            names(found),
+            ["keep"].iter().map(|s| s.to_string()).collect()
+        );
+    }
+
+    #[test]
+    fn negation_pattern_excludes_exact_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n  - '!packages/legacy'\n",
+        );
+        write(&dir.path().join("packages/keep/package.json"), "{}");
+        write(&dir.path().join("packages/legacy/package.json"), "{}");
+
+        let found = find_workspace_packages(dir.path()).unwrap();
+        assert_eq!(
+            names(found),
+            ["keep"].iter().map(|s| s.to_string()).collect()
+        );
+    }
+
+    #[test]
+    fn negation_excluding_everything_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n  - '!packages/*'\n",
+        );
+        write(&dir.path().join("packages/a/package.json"), "{}");
+
+        let found = find_workspace_packages(dir.path()).unwrap();
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn negation_pattern_order_does_not_matter() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - '!**/example/**'\n  - 'packages/*'\n",
+        );
+        write(&dir.path().join("packages/keep/package.json"), "{}");
+        write(&dir.path().join("packages/example/package.json"), "{}");
+
+        let found = find_workspace_packages(dir.path()).unwrap();
+        assert_eq!(
+            names(found),
+            ["keep"].iter().map(|s| s.to_string()).collect()
+        );
+    }
+
+    #[test]
+    fn negation_filters_recursive_positive_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/**'\n  - '!**/test/**'\n",
+        );
+        write(&dir.path().join("packages/a/package.json"), "{}");
+        write(&dir.path().join("packages/a/test/package.json"), "{}");
+        write(&dir.path().join("packages/b/sub/package.json"), "{}");
+
+        let found = find_workspace_packages(dir.path()).unwrap();
+        assert_eq!(
+            names(found),
+            ["a", "sub"].iter().map(|s| s.to_string()).collect()
+        );
+    }
+
+    #[test]
+    fn negation_with_invalid_glob_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n  - '![bad'\n",
+        );
+        let err = find_workspace_packages(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, Error::Parse(_, _)),
+            "expected Error::Parse, got {err:?}"
+        );
     }
 
     #[test]
