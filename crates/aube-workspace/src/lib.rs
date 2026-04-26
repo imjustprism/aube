@@ -40,10 +40,21 @@ pub fn find_workspace_packages(project_dir: &Path) -> Result<Vec<PathBuf>, Error
     let mut positives = Vec::new();
     for raw in &patterns {
         if let Some(rest) = raw.strip_prefix('!') {
-            let matcher = glob::Pattern::new(rest).map_err(|e| {
-                Error::Parse(project_dir.join("pnpm-workspace.yaml"), e.to_string())
-            })?;
-            neg_matchers.push(matcher);
+            let mk = |p: &str| {
+                glob::Pattern::new(p).map_err(|e| {
+                    Error::Parse(project_dir.join("pnpm-workspace.yaml"), e.to_string())
+                })
+            };
+            // pnpm uses micromatch where `**` matches zero-or-more
+            // path components, so `!**/example/**` excludes the
+            // directory `example` itself. The `glob` crate requires
+            // `**` to consume at least one component, so emit a
+            // companion matcher with the trailing `/**` stripped to
+            // catch the directory itself in addition to its descendants.
+            neg_matchers.push(mk(rest)?);
+            if let Some(self_form) = rest.strip_suffix("/**") {
+                neg_matchers.push(mk(self_form)?);
+            }
         } else {
             positives.push(raw.as_str());
         }
@@ -61,7 +72,7 @@ pub fn find_workspace_packages(project_dir: &Path) -> Result<Vec<PathBuf>, Error
     for pattern in &positives {
         for pkg_dir in expand_workspace_pattern(project_dir, pattern)? {
             let rel = pkg_dir.strip_prefix(project_dir).unwrap_or(&pkg_dir);
-            if is_negated(&neg_matchers, rel) {
+            if neg_matchers.iter().any(|m| m.matches_path(rel)) {
                 continue;
             }
             if seen.insert(pkg_dir.clone()) {
@@ -72,13 +83,6 @@ pub fn find_workspace_packages(project_dir: &Path) -> Result<Vec<PathBuf>, Error
 
     packages.sort_unstable();
     Ok(packages)
-}
-
-fn is_negated(matchers: &[glob::Pattern], rel: &Path) -> bool {
-    let padded = rel.join("_");
-    matchers
-        .iter()
-        .any(|m| m.matches_path(rel) || m.matches_path(&padded))
 }
 
 fn expand_workspace_pattern(project_dir: &Path, pattern: &str) -> Result<Vec<PathBuf>, Error> {
@@ -350,6 +354,28 @@ mod tests {
         assert_eq!(
             names(found),
             ["a", "sub"].iter().map(|s| s.to_string()).collect()
+        );
+    }
+
+    #[test]
+    fn negation_does_not_falsely_match_underscore_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n  - '!**/_'\n",
+        );
+        write(&dir.path().join("packages/keep/package.json"), "{}");
+        write(&dir.path().join("packages/_/package.json"), "{}");
+
+        let found = find_workspace_packages(dir.path()).unwrap();
+        let kept = names(found);
+        assert!(
+            kept.contains("keep"),
+            "underscore-targeted negation must not exclude unrelated dirs; got {kept:?}"
+        );
+        assert!(
+            !kept.contains("_"),
+            "literal-underscore directory must still be excluded; got {kept:?}"
         );
     }
 
