@@ -916,12 +916,12 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                 } else {
                     Some(pkg.transitive_peer_dependencies.clone())
                 },
+                optional: if pkg.optional { Some(true) } else { None },
                 bundled_dependencies: if pkg.bundled_dependencies.is_empty() {
                     None
                 } else {
                     Some(pkg.bundled_dependencies.clone())
                 },
-                optional: if pkg.optional { Some(true) } else { None },
             },
         );
     }
@@ -1305,6 +1305,13 @@ struct WritablePackageInfo {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WritableSnapshot {
+    // Order mirrors pnpm's `LockfilePackageSnapshot` emit order
+    // (dependencies → optionalDependencies → transitivePeerDependencies
+    // → optional) so a parse-then-write round-trip stays diff-clean
+    // against pnpm's own output. `bundledDependencies` is not in pnpm's
+    // snapshot schema (lives on `LockfilePackageInfo`, pre-existing
+    // aube quirk) — placed last so it does not split the pnpm-
+    // canonical block.
     #[serde(skip_serializing_if = "Option::is_none")]
     dependencies: Option<BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1312,9 +1319,9 @@ struct WritableSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     transitive_peer_dependencies: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    bundled_dependencies: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     optional: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundled_dependencies: Option<Vec<String>>,
 }
 
 /// Parse `pnpm-lock.yaml` content, tolerating pnpm v11's multi-document
@@ -3020,6 +3027,24 @@ snapshots:
         assert!(
             written.contains("- supports-color"),
             "writer must list bubbled peers; got:\n{written}"
+        );
+
+        // Field order within a snapshot must match pnpm's
+        // `LockfilePackageSnapshot` emit order so a round-trip stays
+        // diff-clean against pnpm's own output: dependencies →
+        // optionalDependencies → transitivePeerDependencies → optional.
+        // The `@babel/generator` snapshot has `dependencies` followed
+        // by `transitivePeerDependencies`, which is the pair Greptile
+        // flagged as ordered wrong.
+        let deps_line = "\n    dependencies:\n";
+        let tpd_line = "\n    transitivePeerDependencies:\n";
+        let deps_at = written.find(deps_line).expect("dependencies line emitted");
+        let tpd_at = written
+            .find(tpd_line)
+            .expect("transitivePeerDependencies line emitted");
+        assert!(
+            deps_at < tpd_at,
+            "dependencies must precede transitivePeerDependencies; got:\n{written}"
         );
 
         let reparsed = parse(&out_path).unwrap();
