@@ -122,6 +122,63 @@ teardown() {
 	assert_output --partial "auto-install-peers=false"
 }
 
+@test "config with no subcommand lists merged entries" {
+	mkdir proj
+	echo "registry=https://user.example.com/" >"$HOME/.npmrc"
+	echo "autoInstallPeers=false" >proj/.npmrc
+	cd proj
+	run aube config
+	assert_success
+	assert_output --partial "registry=https://user.example.com/"
+	assert_output --partial "auto-install-peers=false"
+}
+
+@test "config with parent --all lists defaults" {
+	run aube config --all
+	assert_success
+	assert_output --partial "auto-install-peers=true (default)"
+}
+
+@test "config list honors parent list flags" {
+	run aube config --all list
+	assert_success
+	assert_output --partial "auto-install-peers=true (default)"
+}
+
+@test "config rejects parent list flags with non-list subcommands" {
+	run aube config --all set registry https://registry.example.com/
+	assert_failure
+	assert_output --partial "list flags must be used with"
+}
+
+@test "config rejects parent list flags with tui subcommand" {
+	run aube config --json tui
+	assert_failure
+	assert_output --partial "list flags must be used with"
+}
+
+@test "config list subcommand location overrides parent location" {
+	echo "registry=https://user.example.com/" >"$HOME/.npmrc"
+	mkdir proj
+	echo "registry=https://project.example.com/" >proj/.npmrc
+	cd proj
+	run aube config --location project list --location user
+	assert_success
+	assert_output --partial "registry=https://user.example.com/"
+	refute_output --partial "project.example.com"
+}
+
+@test "config list subcommand location overrides parent local shortcut" {
+	echo "registry=https://user.example.com/" >"$HOME/.npmrc"
+	mkdir proj
+	echo "registry=https://project.example.com/" >proj/.npmrc
+	cd proj
+	run aube config --local list --location user
+	assert_success
+	assert_output --partial "registry=https://user.example.com/"
+	refute_output --partial "project.example.com"
+}
+
 @test "config list --location project only reads project .npmrc" {
 	mkdir proj
 	echo "registry=https://user.example.com/" >"$HOME/.npmrc"
@@ -226,19 +283,44 @@ teardown() {
 	assert_output "true"
 }
 
-@test "config list --all --json emits defaults as plain values (no annotation)" {
+@test "config list --all --json marks default values" {
 	# Nothing is set — every row in the output is a default, and the JSON
-	# value must not contain the " (default)" suffix the text view uses.
-	run bash -c 'aube config list --all --json | jq -r ".[\"auto-install-peers\"]"'
+	# value should preserve the default-vs-explicit distinction.
+	run bash -c 'aube config list --all --json | jq -r ".[\"auto-install-peers\"].value"'
 	assert_success
-	# Plain string, not "true (default)".
-	refute_output --partial "(default)"
+	assert_output "true"
+	run bash -c 'aube config list --all --json | jq -r ".[\"auto-install-peers\"].default"'
+	assert_success
+	assert_output "true"
 
 	# The parallel text view should still annotate defaults, so the two
 	# outputs stay distinguishable for humans vs. machines.
 	run aube config list --all
 	assert_success
 	assert_output --partial "(default)"
+}
+
+@test "config find searches the generated settings reference" {
+	run aube config find min package install time
+	assert_success
+	assert_line --partial "minimumReleaseAge (minimumReleaseAge) - Delay installation of newly published versions (minutes)."
+}
+
+@test "config explain prints sources for a known setting" {
+	run aube config explain minimum-release-age
+	assert_success
+	assert_line "minimumReleaseAge"
+	assert_line "  Default: 1440"
+	assert_line "  Environment: npm_config_minimum_release_age, NPM_CONFIG_MINIMUM_RELEASE_AGE, AUBE_MINIMUM_RELEASE_AGE"
+	assert_line "  .npmrc keys: minimumReleaseAge, minimum-release-age"
+	assert_line "  Workspace YAML keys: minimumReleaseAge"
+	assert_output --partial "Set to \`0\` to disable."
+}
+
+@test "config tui rejects non-interactive stdout" {
+	run aube config tui
+	assert_failure
+	assert_output --partial "requires an interactive terminal"
 }
 
 # ── top-level get / set aliases ──────────────────────────────────────
