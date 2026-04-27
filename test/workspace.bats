@@ -459,6 +459,59 @@ _setup_shared_direct_dep_workspace() {
 	assert_failure
 }
 
+@test "aube install: workspace dep bins land in dependent's node_modules/.bin" {
+	# discussion #352: workspace package A declares a `bin`, workspace
+	# package B depends on A via `workspace:*`. pnpm symlinks A's bin
+	# into B/node_modules/.bin so npm scripts in B can call it; aube
+	# previously skipped these because workspace deps have no
+	# `.aube/<dep_path>` materialization. Multiple consumers exercise
+	# the per-install ws-package-json read cache.
+	mkdir -p packages/app1 packages/app2 tools/dev/bin
+	cat >package.json <<-'EOF'
+		{"name": "root", "private": true, "version": "1.0.0"}
+	EOF
+	cat >pnpm-workspace.yaml <<-'EOF'
+		packages:
+		  - packages/*
+		  - tools/*
+	EOF
+	cat >tools/dev/package.json <<-'EOF'
+		{
+		  "name": "@test/dev",
+		  "version": "1.0.0",
+		  "bin": {"my-tool": "./bin/my-tool.mjs"}
+		}
+	EOF
+	printf '#!/usr/bin/env node\nconsole.log("ok")\n' >tools/dev/bin/my-tool.mjs
+	chmod +x tools/dev/bin/my-tool.mjs
+	cat >packages/app1/package.json <<-'EOF'
+		{
+		  "name": "@test/app1",
+		  "version": "1.0.0",
+		  "devDependencies": {"@test/dev": "workspace:*"}
+		}
+	EOF
+	cat >packages/app2/package.json <<-'EOF'
+		{
+		  "name": "@test/app2",
+		  "version": "1.0.0",
+		  "devDependencies": {"@test/dev": "workspace:*"}
+		}
+	EOF
+
+	run aube install
+	assert_success
+
+	# Shim exists in each consumer's .bin and resolves to the
+	# workspace package's bin script.
+	for app in app1 app2; do
+		run test -e "packages/$app/node_modules/.bin/my-tool"
+		assert_success
+		target="$(readlink -f "packages/$app/node_modules/.bin/my-tool")"
+		[[ "$target" == *"tools/dev/bin/my-tool.mjs" ]]
+	done
+}
+
 @test "aube install: dedupeDirectDeps=true keeps child symlink when versions differ" {
 	mkdir -p packages/app
 	# Root pins is-number@3.0.0, child pins is-number@6.0.0 — both are

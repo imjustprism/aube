@@ -1,8 +1,14 @@
 use aube_lockfile::dep_path_filename::dep_path_to_filename;
 use miette::{Context, IntoDiagnostic, miette};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 pub(crate) type PkgJsonCache = BTreeMap<String, Option<serde_json::Value>>;
+
+/// Per-install cache of workspace-package `package.json` reads. Keyed
+/// by the workspace dir on disk so a popular tooling package consumed
+/// by many importers gets read and parsed once, not once per consumer.
+pub(crate) type WsPkgJsonCache = BTreeMap<PathBuf, Option<serde_json::Value>>;
 
 /// Link bin entries from packages to node_modules/.bin/
 /// Compute the on-disk directory a dep's materialized package lives
@@ -187,24 +193,79 @@ pub(super) fn link_bins(
     placements: Option<&aube_linker::HoistedPlacements>,
     shim_opts: aube_linker::BinShimOptions,
     cache: &mut PkgJsonCache,
+    ws_dirs: Option<&BTreeMap<String, PathBuf>>,
+    ws_cache: &mut WsPkgJsonCache,
 ) -> miette::Result<()> {
     let bin_dir = project_dir.join(modules_dir_name).join(".bin");
     std::fs::create_dir_all(&bin_dir).into_diagnostic()?;
 
     for dep in graph.root_deps() {
-        link_bins_for_dep(
-            cache,
-            aube_dir,
-            &bin_dir,
-            graph,
-            &dep.dep_path,
-            &dep.name,
-            virtual_store_dir_max_length,
-            placements,
-            shim_opts,
-        )?;
+        if let Some(ws_dir) = ws_dirs.and_then(|m| m.get(&dep.name)) {
+            link_bins_for_workspace_dep(ws_cache, &bin_dir, ws_dir, &dep.name, shim_opts)?;
+        } else {
+            link_bins_for_dep(
+                cache,
+                aube_dir,
+                &bin_dir,
+                graph,
+                &dep.dep_path,
+                &dep.name,
+                virtual_store_dir_max_length,
+                placements,
+                shim_opts,
+            )?;
+        }
     }
 
+    Ok(())
+}
+
+/// Link bins declared by a `workspace:` dep into the importer's
+/// `.bin/`. Workspace deps don't get a `.aube/<dep_path>/` materialization
+/// (the linker symlinks them straight into the importer's `node_modules/`),
+/// so `link_bins_for_dep` finds nothing on disk and silently skips. Read
+/// the workspace package's own `package.json` and shim each bin entry,
+/// matching pnpm's behavior of exposing workspace bins to dependent
+/// packages' npm scripts.
+///
+/// `cache` deduplicates the read+parse across importers — without it,
+/// a popular tooling package consumed by N workspace members gets its
+/// `package.json` read N times during a single install.
+pub(super) fn link_bins_for_workspace_dep(
+    cache: &mut WsPkgJsonCache,
+    bin_dir: &Path,
+    ws_dir: &Path,
+    name: &str,
+    shim_opts: aube_linker::BinShimOptions,
+) -> miette::Result<()> {
+    let pkg_json = if let Some(cached) = cache.get(ws_dir) {
+        cached.clone()
+    } else {
+        let pkg_json_path = ws_dir.join("package.json");
+        let parsed = match std::fs::read_to_string(&pkg_json_path) {
+            Ok(content) => Some(
+                aube_manifest::parse_json::<serde_json::Value>(&pkg_json_path, content)
+                    .map_err(miette::Report::new)
+                    .wrap_err_with(|| {
+                        format!("failed to parse package.json for workspace dep {name}")
+                    })?,
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(miette!(
+                    "failed to read package.json for workspace dep {name} at {}: {e}",
+                    pkg_json_path.display()
+                ));
+            }
+        };
+        cache.insert(ws_dir.to_path_buf(), parsed.clone());
+        parsed
+    };
+    if let Some(pkg_json) = pkg_json
+        && let Some(bin) = pkg_json.get("bin")
+    {
+        link_bin_entries(bin_dir, ws_dir, Some(name), bin, shim_opts)?;
+    }
     Ok(())
 }
 
@@ -489,6 +550,8 @@ mod tests {
             None,
             aube_linker::BinShimOptions::default(),
             &mut PkgJsonCache::new(),
+            None,
+            &mut WsPkgJsonCache::new(),
         )
         .unwrap();
 

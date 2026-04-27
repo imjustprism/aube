@@ -3190,6 +3190,8 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     };
     if !virtual_store_only {
         let mut pkg_json_cache = bin_linking::PkgJsonCache::new();
+        let mut ws_pkg_json_cache = bin_linking::WsPkgJsonCache::new();
+        let ws_dirs_for_bins = has_workspace.then_some(&ws_dirs);
         link_bins(
             &cwd,
             &modules_dir_name,
@@ -3199,6 +3201,8 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             placements_ref,
             shim_opts,
             &mut pkg_json_cache,
+            ws_dirs_for_bins,
+            &mut ws_pkg_json_cache,
         )?;
         // Root importer's own `bin` (discussion #228). Runs after
         // `link_bins` so a self-bin overrides a same-named dep bin.
@@ -3241,17 +3245,27 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 let bin_dir = pkg_dir.join(&modules_dir_name).join(".bin");
                 std::fs::create_dir_all(&bin_dir).into_diagnostic()?;
                 for dep in deps {
-                    link_bins_for_dep(
-                        &mut pkg_json_cache,
-                        &aube_dir,
-                        &bin_dir,
-                        &graph_for_link,
-                        &dep.dep_path,
-                        &dep.name,
-                        virtual_store_dir_max_length,
-                        placements_ref,
-                        shim_opts,
-                    )?;
+                    if let Some(ws_dir) = ws_dirs.get(&dep.name) {
+                        bin_linking::link_bins_for_workspace_dep(
+                            &mut ws_pkg_json_cache,
+                            &bin_dir,
+                            ws_dir,
+                            &dep.name,
+                            shim_opts,
+                        )?;
+                    } else {
+                        link_bins_for_dep(
+                            &mut pkg_json_cache,
+                            &aube_dir,
+                            &bin_dir,
+                            &graph_for_link,
+                            &dep.dep_path,
+                            &dep.name,
+                            virtual_store_dir_max_length,
+                            placements_ref,
+                            shim_opts,
+                        )?;
+                    }
                 }
                 // Workspace member's own `bin` (discussion #228). `manifests`
                 // was parsed once upstream and keys by importer relpath.
