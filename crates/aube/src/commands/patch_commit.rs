@@ -60,7 +60,7 @@ pub async fn run(args: PatchCommitArgs) -> Result<()> {
         .into_diagnostic()
         .map_err(|e| miette!("failed to create {}: {e}", abs_dir.display()))?;
     let abs_path = abs_dir.join(&file_name);
-    std::fs::write(&abs_path, &patch)
+    aube_util::fs_atomic::atomic_write(&abs_path, patch.as_bytes())
         .into_diagnostic()
         .map_err(|e| miette!("failed to write {}: {e}", abs_path.display()))?;
 
@@ -71,7 +71,14 @@ pub async fn run(args: PatchCommitArgs) -> Result<()> {
         rel_dir.to_string_lossy().replace('\\', "/")
     );
     let key = format!("{}@{}", state.name, state.version);
-    upsert_patched_dependency(&cwd, &key, &rel_path)?;
+    // If the manifest update fails (concurrent writer, disk full, file
+    // locked on Windows), roll back the patch file. Otherwise we leave
+    // an orphan that no future install will see. `load_patches` reads
+    // package.json, not the patches dir.
+    if let Err(e) = upsert_patched_dependency(&cwd, &key, &rel_path) {
+        let _ = std::fs::remove_file(&abs_path);
+        return Err(e);
+    }
 
     eprintln!("Wrote {}", abs_path.display());
     eprintln!("Recorded {key} -> {rel_path} in package.json");
