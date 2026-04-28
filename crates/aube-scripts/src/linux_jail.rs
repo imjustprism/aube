@@ -62,12 +62,12 @@ pub(crate) fn apply_landlock(jail: &ScriptJail, home: &Path) -> Result<(), Strin
         .map_err(|e| format!("failed to create jail ruleset: {e}"))?;
 
     ruleset = add_rule(ruleset, Path::new("/"), read_access)?;
-    for path in [
-        Path::new("/dev"),
-        jail.package_dir.as_path(),
-        home,
-        std::env::temp_dir().as_path(),
-    ] {
+    // `home` already has `full_access` and `apply_jail_env` points
+    // TMPDIR/TMP/TEMP at it, so build scripts get a writable scratch
+    // dir without granting kernel-level write to the world-writable
+    // system `/tmp`. Granting `/tmp` would let a script read another
+    // tenant's tmp files or seed symlink races on shared CI hosts.
+    for path in [Path::new("/dev"), jail.package_dir.as_path(), home] {
         ruleset = add_rule_with_canonical(ruleset, path, full_access)?;
     }
     for path in &jail.write_paths {
@@ -89,40 +89,35 @@ pub(crate) fn apply_landlock(jail: &ScriptJail, home: &Path) -> Result<(), Strin
 pub(crate) fn apply_seccomp_net_filter() -> Result<(), String> {
     let target_arch = TargetArch::try_from(std::env::consts::ARCH)
         .map_err(|e| format!("unsupported architecture for jail network filter: {e}"))?;
-    let socket_rule_inet = SeccompRule::new(vec![
-        SeccompCondition::new(
-            0,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Eq,
-            libc::AF_INET as u64,
-        )
-        .map_err(|e| format!("failed to build jail network filter: {e}"))?,
-    ])
-    .map_err(|e| format!("failed to build jail network filter: {e}"))?;
-    let socket_rule_inet6 = SeccompRule::new(vec![
-        SeccompCondition::new(
-            0,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Eq,
-            libc::AF_INET6 as u64,
-        )
-        .map_err(|e| format!("failed to build jail network filter: {e}"))?,
-    ])
-    .map_err(|e| format!("failed to build jail network filter: {e}"))?;
+    // Default-deny on socket family. Old code listed AF_INET and AF_INET6
+    // with mismatch_action=Allow, which left AF_UNIX, AF_NETLINK, AF_PACKET
+    // and every other family open. A jailed script could `connect()` to
+    // `/var/run/docker.sock` over AF_UNIX for full host takeover.
+    // Allowlist the families a build script legitimately needs (none for
+    // the network=false jail), block the rest with EAFNOSUPPORT so callers
+    // get the same errno the kernel emits for an unsupported family.
+    let mk_family_rule = |family: i32| -> Result<SeccompRule, String> {
+        SeccompRule::new(vec![
+            SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, family as u64)
+                .map_err(|e| format!("failed to build jail network filter: {e}"))?,
+        ])
+        .map_err(|e| format!("failed to build jail network filter: {e}"))
+    };
+    // node-gyp and other native build helpers occasionally use AF_UNIX
+    // for IPC with helper processes spawned inside the jail. Keep it
+    // allowed so legitimate native builds work, deny everything else.
+    let allow_unix = mk_family_rule(libc::AF_UNIX)?;
 
     let mut rules = BTreeMap::new();
     #[allow(clippy::useless_conversion)]
     for syscall in [libc::SYS_socket, libc::SYS_socketpair].map(i64::from) {
-        rules.insert(
-            syscall,
-            vec![socket_rule_inet.clone(), socket_rule_inet6.clone()],
-        );
+        rules.insert(syscall, vec![allow_unix.clone()]);
     }
 
     let filter: BpfProgram = SeccompFilter::new(
         rules,
+        SeccompAction::Errno(libc::EAFNOSUPPORT as u32),
         SeccompAction::Allow,
-        SeccompAction::Errno(libc::EPERM as u32),
         target_arch,
     )
     .map_err(|e| format!("failed to build jail network filter: {e}"))?
