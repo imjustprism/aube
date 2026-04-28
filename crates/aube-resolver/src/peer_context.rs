@@ -335,9 +335,11 @@ pub fn apply_peer_contexts(
     // rewritten tails. Linker reads tails directly to locate sibling
     // symlink targets, stale tails produce broken `node_modules`.
     let graph_hash = |g: &LockfileGraph| -> u64 {
-        let mut tokens: Vec<&str> = Vec::with_capacity(g.packages.len() * 4);
+        let total_deps: usize = g.packages.values().map(|p| p.dependencies.len()).sum();
+        let mut tokens: Vec<&str> = Vec::with_capacity(g.packages.len() * 3 + total_deps * 2);
         for (k, pkg) in &g.packages {
             tokens.push(k.as_str());
+            tokens.push("\x1f");
             for (name, tail) in &pkg.dependencies {
                 tokens.push(name.as_str());
                 tokens.push(tail.as_str());
