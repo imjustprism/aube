@@ -117,6 +117,10 @@ pub(crate) fn apply_seccomp_net_filter() -> Result<(), String> {
         rules.insert(syscall, vec![allow_unix.clone()]);
     }
 
+    // SeccompFilter::new arg order: rules, mismatch_action, match_action,
+    // arch. mismatch fires when a listed syscall is called with args
+    // that no rule matches (non-AF_UNIX socket call -> EPERM). match
+    // fires when a rule matches (AF_UNIX socket call -> Allow).
     let filter: BpfProgram = SeccompFilter::new(
         rules,
         SeccompAction::Errno(libc::EPERM as u32),
