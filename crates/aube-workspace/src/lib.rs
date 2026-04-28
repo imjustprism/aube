@@ -143,15 +143,16 @@ fn glob_workspace_pattern(project_dir: &Path, pattern: &str) -> Vec<PathBuf> {
 /// containing `..` (e.g. `../sibling`) lexically still start with the
 /// project prefix but escape the root via parent components. pnpm
 /// rejects these and so do we. Falls back to lexical compare when
-/// canonicalization fails (path doesn't exist) so pre-existing dirs
-/// keep working in that branch.
+/// canonicalization fails (permission error, mid-walk race) so a path
+/// the glob already returned still gets a containment check.
 fn is_under_project(project_dir: &Path, candidate: &Path) -> bool {
-    match (project_dir.canonicalize(), candidate.canonicalize()) {
-        (Ok(root), Ok(child)) => child.starts_with(root),
-        _ => candidate
-            .components()
-            .all(|c| !matches!(c, std::path::Component::ParentDir)),
+    if let (Ok(root), Ok(child)) = (project_dir.canonicalize(), candidate.canonicalize()) {
+        return child.starts_with(root);
     }
+    let no_parent_dir = candidate
+        .components()
+        .all(|c| !matches!(c, std::path::Component::ParentDir));
+    no_parent_dir && candidate.starts_with(project_dir)
 }
 
 fn workspace_pattern_root(project_dir: &Path, pattern: &str) -> PathBuf {
