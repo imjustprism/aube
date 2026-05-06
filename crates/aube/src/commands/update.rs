@@ -1,7 +1,7 @@
 use super::install;
 use clap::Args;
 use miette::{Context, IntoDiagnostic, miette};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Debug, Clone, Args)]
 pub struct UpdateArgs {
@@ -512,13 +512,19 @@ pub async fn run(
             None => (None, Vec::new()),
         };
     let workspace_catalogs = super::load_workspace_catalogs(&cwd)?;
+    let workspace_package_versions = workspace_package_versions(&cwd)?;
     let mut resolver = super::build_resolver(&cwd, &manifest, workspace_catalogs);
     if let Some(host) = read_package_host {
         resolver = resolver
             .with_read_package_hook(Box::new(host) as Box<dyn aube_resolver::ReadPackageHook>);
     }
+    let resolver_manifests = [(".".to_string(), resolver_manifest)];
     let mut graph = resolver
-        .resolve(&resolver_manifest, filtered_existing.as_ref())
+        .resolve_workspace(
+            &resolver_manifests,
+            filtered_existing.as_ref(),
+            &workspace_package_versions,
+        )
         .await
         .map_err(miette::Report::new)
         .wrap_err("failed to resolve dependencies")?;
@@ -662,6 +668,30 @@ pub async fn run(
     Ok(())
 }
 
+fn workspace_package_versions(cwd: &std::path::Path) -> miette::Result<HashMap<String, String>> {
+    let workspace_root = crate::dirs::find_workspace_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let workspace_packages = aube_workspace::find_workspace_packages(&workspace_root)
+        .into_diagnostic()
+        .wrap_err("failed to discover workspace packages")?;
+    let mut versions = HashMap::new();
+    for pkg_dir in workspace_packages {
+        let pkg_manifest = aube_manifest::PackageJson::from_path(&pkg_dir.join("package.json"))
+            .map_err(miette::Report::new)
+            .wrap_err_with(|| format!("failed to read {}/package.json", pkg_dir.display()))?;
+        if let Some(name) = pkg_manifest.name {
+            let version = pkg_manifest.version.unwrap_or_else(|| "0.0.0".to_string());
+            versions.insert(name, version);
+        } else {
+            tracing::warn!(
+                code = aube_codes::warnings::WARN_AUBE_WORKSPACE_PACKAGE_MISSING_NAME,
+                "workspace package at {} has no 'name' field; skipping workspace version registration",
+                pkg_dir.display()
+            );
+        }
+    }
+    Ok(versions)
+}
+
 struct UpdateSettings {
     ignored: BTreeSet<String>,
     rewrites_specifier: bool,
@@ -672,12 +702,14 @@ fn resolve_update_settings(
     manifest: &aube_manifest::PackageJson,
 ) -> miette::Result<UpdateSettings> {
     let npmrc_entries = aube_registry::config::load_npmrc_entries(cwd);
+    let aube_config_entries = crate::commands::config::load_user_aube_config_entries();
     let (_workspace_config, raw_workspace) = aube_manifest::workspace::load_both(cwd)
         .into_diagnostic()
         .wrap_err("failed to read workspace config")?;
     let env = aube_settings::values::process_env();
     let ctx = aube_settings::ResolveCtx {
         npmrc: &npmrc_entries,
+        aube_config: &aube_config_entries,
         workspace_yaml: &raw_workspace,
         env,
         cli: &[],

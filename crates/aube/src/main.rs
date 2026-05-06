@@ -510,6 +510,9 @@ impl Drop for SilentStderrGuard {
 // has no fixed name so the sort check skips it.
 #[derive(Subcommand)]
 enum Commands {
+    /// Bootstrap aube's cached node-gyp and print the executable path.
+    #[command(name = "__node-gyp-bootstrap", hide = true)]
+    NodeGypBootstrap { project_dir: PathBuf },
     /// Add a dependency
     #[command(visible_alias = "a")]
     Add(commands::add::AddArgs),
@@ -802,10 +805,12 @@ fn inner_main() -> miette::Result<()> {
         let use_stderr_active = cli.use_stderr
             || startup_cwd(&cli).ok().is_some_and(|cwd| {
                 let npmrc = aube_registry::config::load_npmrc_entries(&cwd);
+                let aube_config = commands::config::load_user_aube_config_entries();
                 let ws = std::collections::BTreeMap::new();
                 let env_snap = aube_settings::values::capture_env();
                 let ctx = aube_settings::ResolveCtx {
                     npmrc: &npmrc,
+                    aube_config: &aube_config,
                     workspace_yaml: &ws,
                     env: &env_snap,
                     cli: &[],
@@ -927,6 +932,9 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
     });
 
     match cli.command {
+        Some(Commands::NodeGypBootstrap { project_dir }) => {
+            commands::install::node_gyp_bootstrap::print_bootstrapped_binary(&project_dir).await?
+        }
         Some(Commands::Add(args)) => {
             commands::add::run(args, effective_filter.clone()).await?;
         }
@@ -1319,10 +1327,12 @@ fn startup_cwd(cli: &Cli) -> miette::Result<PathBuf> {
 fn load_startup_settings() -> miette::Result<StartupSettings> {
     let cwd = std::env::current_dir().into_diagnostic()?;
     let npmrc = aube_registry::config::load_npmrc_entries(&cwd);
+    let aube_config = commands::config::load_user_aube_config_entries();
     let empty_ws = std::collections::BTreeMap::new();
     let env = aube_settings::values::capture_env();
     let ctx = aube_settings::ResolveCtx {
         npmrc: &npmrc,
+        aube_config: &aube_config,
         workspace_yaml: &empty_ws,
         env: &env,
         cli: &[],
@@ -1714,8 +1724,10 @@ async fn run_install_command(
         .wrap_err("failed to load workspace config")?;
     let env = aube_settings::values::capture_env();
     let cli_flags = args.to_cli_flag_bag(global_frozen, global_gvs);
+    let aube_config = commands::config::load_user_aube_config_entries();
     let ctx = aube_settings::ResolveCtx {
         npmrc: &npmrc,
+        aube_config: &aube_config,
         workspace_yaml: &raw_ws,
         env: &env,
         cli: &cli_flags,

@@ -14,7 +14,7 @@ mod dep_selection;
 mod frozen;
 mod git_prepare;
 mod lifecycle;
-mod node_gyp_bootstrap;
+pub(crate) mod node_gyp_bootstrap;
 mod settings;
 mod side_effects_cache;
 
@@ -849,12 +849,14 @@ pub(super) async fn fetch_packages(
     // path share the same hardcoded fallback behavior when no
     // setting is configured.
     let npmrc_entries = aube_registry::config::load_npmrc_entries(&cwd);
+    let aube_config_entries = crate::commands::config::load_user_aube_config_entries();
     let raw_workspace = aube_manifest::workspace::load_both(&cwd)
         .map(|(_, raw)| raw)
         .unwrap_or_default();
     let env = aube_settings::values::process_env();
     let ctx = aube_settings::ResolveCtx {
         npmrc: &npmrc_entries,
+        aube_config: &aube_config_entries,
         workspace_yaml: &raw_workspace,
         env,
         cli: &[],
@@ -1737,6 +1739,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     // the same borrow feeds both the resolve-time settings and the
     // later engine-check settings.
     let npmrc_entries = aube_registry::config::load_npmrc_entries(&cwd);
+    let aube_config_entries = crate::commands::config::load_user_aube_config_entries();
     let (ws_config_shared, raw_workspace) = aube_manifest::workspace::load_both(&cwd)
         .into_diagnostic()
         .wrap_err("failed to load workspace config")?;
@@ -1748,6 +1751,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     let workspace_catalogs = super::discover_catalogs(&cwd)?;
     let settings_ctx = aube_settings::ResolveCtx {
         npmrc: &npmrc_entries,
+        aube_config: &aube_config_entries,
         workspace_yaml: &raw_workspace,
         env: &opts.env_snapshot,
         cli: &opts.cli_flags,
